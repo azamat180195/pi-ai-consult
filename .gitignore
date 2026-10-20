@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+package-lock.json.bak
+
+# Logs & temporary files
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# User profiles, cookies, and local session caches (NEVER COMMIT)
+*profile*
+*-profile/
+ai-consult-profile/
+*last-chat.json
+ai-consult-last-chat.json
+*.jsonl

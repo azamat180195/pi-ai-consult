@@ -1,0 +1,15 @@
+{
+  "name": "pi-extension-ai-consult",
+  "version": "1.0.0",
+  "description": "Consult with Claude (claude.ai) and ChatGPT (chatgpt.com) directly from Pi Coding Agent using your logged-in browser account.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "playwright-core": "^1.50.0",
+    "typebox": "^1.3.37"
+  }
+}
