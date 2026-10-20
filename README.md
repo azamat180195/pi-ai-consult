@@ -20,7 +20,7 @@ Get senior engineering reviews, architecture advice, and complete code artifacts
 
 ### 1. 🧠 Multi-Provider Web Consultation
 - **Google Gemini**: Access **Gemini 4 Argon** (Сложные задачи) with deep reasoning (`Высокая`, `Средний`, `Низкая`), as well as `3.1 Pro` and `3.8 Flash`.
-- **Claude (Anthropic)**: Access **Claude 3.5 Sonnet**, **Opus**, and **Haiku** with customizable effort levels (`Low`, `Medium`, `High`, `Extra`, `Max`).
+- **Claude (Anthropic)**: Access **Claude Sonnet 5.5**, **Opus**, and **Haiku** with customizable effort levels (`Low`, `Medium`, `High`, `Extra`, `Max`).
 - **ChatGPT (OpenAI)**: Automatic **Think (Reasoning) Mode** activation (`think: true`) for complex debugging and architectural design.
 - **Unified Tool (`consult_ai`)**: A single unified tool that can consult any of the three providers seamlessly.
 
@@ -66,7 +66,17 @@ Run `/ai-consult doctor` to verify Pi version compatibility, Playwright driver s
 
 ### Step 1: Install the Extension
 
-Clone or copy this repository into your Pi Agent extensions directory:
+#### Method A: Direct Pi Package Install (Recommended)
+You can install this extension directly using Pi's built-in package manager:
+
+```bash
+pi install git:github.com/azamat180195/pi-ai-consult
+```
+
+Pi will automatically clone, install dependencies, and register the extension into your settings.
+
+#### Method B: Manual Git Clone
+Alternatively, you can clone it manually into your user extensions directory:
 
 ```bash
 # Windows
@@ -103,13 +113,13 @@ Run the health check command:
 
 Output:
 ```text
-🩺 [ai-consult Doctor - Tizim salomatligi]:
-  Pi versiyasi: 1.3.0
-  Kengaytma manzili: ~/.pi/agent/extensions/ai-consult
-  Playwright kutubxonasi: O'rnatilgan va faol
-  Brauzer ulanishi: CDP (port 9222)
-  Update daxlsizligi: Tashqi papkada saqlangan (Avtomatik ishlaydi)
-  Xulosa: Barcha tizimlar 100% sog'lom!
+🩺 [ai-consult Doctor - System Health Check]:
+  Pi Core Version: 1.3.0
+  Extension Directory: ~/.pi/agent/extensions/ai-consult
+  Playwright Driver: Installed & Active
+  Browser Mode: CDP (remote debugging on port 9222)
+  Update Survivability: Isolated user extension directory (100% update-proof)
+  Summary: All systems healthy and ready!
 ```
 
 ---

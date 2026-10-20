@@ -810,7 +810,7 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
 
     if (subCmd === "reset-limit") {
       await ChatStore.clearLimit();
-      ctx.ui.notify("[ai-consult] Saqlangan barcha limitlar tozalandi! Qaytadan so'rov yuborishingiz mumkin.", "info");
+      ctx.ui.notify("[ai-consult] All cached provider limits cleared! You can now send new queries.", "info");
       return;
     }
 
@@ -824,13 +824,13 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
       } catch {}
 
       const lines = [
-        `🩺 [ai-consult Doctor - Tizim salomatligi]:`,
-        `  Pi versiyasi: ${piVer}`,
-        `  Kengaytma manzili: ~/.pi/agent/extensions/ai-consult`,
-        `  Playwright kutubxonasi: O'rnatilgan va faol`,
-        `  Brauzer ulanishi: ${status.mode === "cdp" ? "CDP (port 9222)" : "Doimiy profil"}`,
-        `  Update daxlsizligi: Tashqi papkada saqlangan (Avtomatik ishlaydi)`,
-        `  Xulosa: Barcha tizimlar 100% sog'lom!`,
+        `🩺 [ai-consult Doctor - System Health Check]:`,
+        `  Pi Core Version: ${piVer}`,
+        `  Extension Directory: ~/.pi/agent/extensions/ai-consult`,
+        `  Playwright Driver: Installed & Active`,
+        `  Browser Mode: ${status.mode === "cdp" ? "CDP (remote debugging on port 9222)" : "Persistent Profile"}`,
+        `  Update Survivability: Isolated user extension directory (100% update-proof)`,
+        `  Summary: All systems healthy and ready!`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
       return;
@@ -838,12 +838,12 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
 
     if (subCmd === "close") {
       await browserManager.close();
-      ctx.ui.notify("[ai-consult] Brauzer yopildi.", "info");
+      ctx.ui.notify("[ai-consult] Browser closed.", "info");
       return;
     }
 
     ctx.ui.notify(
-      "Buyruqlar:\n  /ai-consult status\n  /ai-consult doctor\n  /ai-consult reset-limit\n  /ai-consult login [claude|chatgpt|gemini]\n  /ai-consult effort [Low|Medium|High|Extra|Max]\n  /ai-consult claude [--effort <level>] <savol>\n  /ai-consult chatgpt <savol>\n  /ai-consult launch-chrome\n  /ai-consult close",
+      "Commands:\n  /ai-consult status\n  /ai-consult doctor\n  /ai-consult reset-limit\n  /ai-consult login [claude|chatgpt|gemini]\n  /ai-consult effort [Low|Medium|High|Extra|Max]\n  /ai-consult claude [--effort <level>] <question>\n  /ai-consult chatgpt <question>\n  /ai-consult launch-chrome\n  /ai-consult close",
       "info",
     );
   };
