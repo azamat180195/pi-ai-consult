@@ -198,7 +198,6 @@ export class BrowserManager {
             `--remote-debugging-port=${this.cdpPort}`,
             `--remote-debugging-address=127.0.0.1`,
             `--user-data-dir=${this.profileDir}`,
-            "--disable-blink-features=AutomationControlled",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-background-timer-throttling",
@@ -240,8 +239,8 @@ export class BrowserManager {
     const launchOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
       headless,
       viewport: { width: 1280, height: 850 },
+      ignoreDefaultArgs: ["--enable-automation"],
       args: [
-        "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-infobars",
         "--window-size=1280,850",
