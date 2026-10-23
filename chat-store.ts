@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import type { ConsultState, InfoNeed } from "./protocol";
 
 export type IntentStatus = "sending" | "streaming" | "done" | "failed";
 
@@ -14,6 +15,25 @@ export interface Intent {
   updatedAt: number;
 }
 
+export interface LoopState {
+  round: number;
+  state: ConsultState | "UNKNOWN" | "INCOMPLETE";
+  pending: InfoNeed[];
+  lastNeedsKey: string;
+  nudges: number;
+}
+
+export const emptyLoop = (): LoopState => ({
+  round: 0,
+  state: "FINAL",
+  pending: [],
+  lastNeedsKey: "",
+  nudges: 0,
+});
+
+export const isLoopOpen = (l?: LoopState): boolean =>
+  !!l && l.state !== "FINAL" && l.round > 0;
+
 export interface ChatSessionInfo {
   chatUrl: string;
   lastPrompt?: string;
@@ -21,6 +41,7 @@ export interface ChatSessionInfo {
   updatedAt: number;
   rateLimitedUntil?: number;
   turns?: number;
+  loop?: LoopState;
 }
 
 interface Rec {
@@ -31,6 +52,7 @@ interface Rec {
   rateLimitedUntil?: number;
   updatedAt?: number;
   intent?: Intent;
+  loop?: LoopState;
 }
 
 export type Decision = "chatgpt" | "autonomous" | "wait";
@@ -304,6 +326,40 @@ export class ChatStore {
       } else if (d.limits) {
         delete d.limits[provider];
       }
+    });
+  }
+
+  public static async getLoop(
+    provider: "claude" | "chatgpt" | "gemini",
+    cwd = process.cwd(),
+  ): Promise<LoopState> {
+    const scope = getScopeKey(cwd);
+    return mutate((d) => {
+      const r = getRec(d, scope, provider);
+      return r.loop ?? emptyLoop();
+    });
+  }
+
+  public static async setLoop(
+    provider: "claude" | "chatgpt" | "gemini",
+    loop: LoopState,
+    cwd = process.cwd(),
+  ): Promise<void> {
+    const scope = getScopeKey(cwd);
+    await mutate((d) => {
+      const r = getRec(d, scope, provider);
+      r.loop = loop;
+    });
+  }
+
+  public static async clearLoop(
+    provider: "claude" | "chatgpt" | "gemini",
+    cwd = process.cwd(),
+  ): Promise<void> {
+    const scope = getScopeKey(cwd);
+    await mutate((d) => {
+      const r = getRec(d, scope, provider);
+      r.loop = emptyLoop();
     });
   }
 }

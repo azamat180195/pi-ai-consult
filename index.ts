@@ -27,26 +27,40 @@ import { ClaudeProvider } from "./claude-provider.js";
 import { ChatGPTProvider } from "./chatgpt-provider.js";
 import { GeminiProvider } from "./gemini-provider.js";
 import { SecretRedactor } from "./secret-redactor.js";
-
-const CONSULT_FOLLOWUP_NOTICE =
-  "\n\n---\n💡 [MUHIM ESLATMA]: Agar ushbu javobda biror narsa tushunarsiz, noaniq bo'lsa yoki to'liq kod/yechim yetishmayotgan bo'lsa, sessiyani yopmasdan darhol shu asbobni `newChat: false` bilan qayta chaqiring va aniqlashtiruvchi savol bering! Faqat 100% to'liq va tushunarli yechim olingach foydalanuvchiga taqdim eting.";
+import { ChatStore, emptyLoop, isLoopOpen, type LoopState } from "./chat-store.js";
+import { checkEnglish } from "./language-guard.js";
+import {
+  PROTOCOL_FOOTER,
+  MAX_ROUNDS,
+  parseReply,
+  isReadOnlyCommand,
+  type ParsedReply,
+} from "./protocol.js";
 
 const CONSULT_MULTI_TURN_GUIDELINES = [
+  "LANGUAGE ENFORCEMENT - ENGLISH ONLY FOR PROMPTS:",
+  "  - All prompts sent to external AIs (Claude, ChatGPT, Gemini) MUST be written in technical English only!",
+  "  - Code, logs, error messages, and file paths remain verbatim.",
+  "  - The FINAL explanation/report to the user must be delivered in Uzbek.",
+  "DETERMINISTIC MULTI-TURN EVIDENCE & CLARIFICATION LOOP:",
+  "  - Every consultation call must specify an `intent`:",
+  "      * 'initial': starts a new consultation topic (requires newChat: true).",
+  "      * 'clarify': asks for clarification on vague, incomplete, or broken parts (requires newChat: false).",
+  "      * 'evidence': answers the external AI's requests for data/files/logs (requires newChat: false and evidence[]).",
+  "      * 'verify': asks the external AI to double-check its final recommendations (requires newChat: false).",
+  "  - Inspect the returned `STATUS:` in the tool result:",
+  "      * 'NEEDS_FOLLOWUP': The external AI is waiting for specific logs, config files, or command outputs. Your turn is NOT finished! Do not summarize to the user yet! Immediately collect the requested items using your bash/read/grep tools, and call the consult tool again with `intent: 'evidence'`, `newChat: false`, and `evidence: [...]`.",
+  "      * 'NEEDS_CLARIFICATION': The response was vague, incomplete, or technically suspicious. Do NOT guess! Call again with `intent: 'clarify'`, `newChat: false`, quote the exact unclear part, and request exact configurations.",
+  "      * 'INCOMPLETE': The response was cut off while streaming. Call again with `intent: 'clarify'`, `newChat: false` to continue generating.",
+  "      * 'FINAL': The external AI declared nothing else is needed. Now write the comprehensive final report to the user in UZBEK.",
+  "EVIDENCE & SAFETY RULES:",
+  "  - When the external AI requests command outputs, run ONLY safe read-only commands (grep, cat, ls, pfctl -sr, etc.).",
+  "  - Never run destructive or state-modifying commands without explicit user permission.",
+  "  - If an item cannot be collected, send it with `status: 'unavailable'` and a `note` explaining why. Never invent or falsify outputs.",
   "CRITICAL CREDENTIALS & SECRETS PROTECTION:",
   "  - NEVER include real production passwords, private keys, API tokens, or secrets when consulting external models!",
   "  - Always replace real credentials with safe placeholders (e.g. 'your_db_password', '[REDACTED_PASSWORD]', 'CHANGE_ME').",
   "  - The extension automatically redacts detected secrets (keys, passwords, tokens) before sending as a defense-in-depth safety measure.",
-  "MANDATORY MULTI-TURN QUALITY & CLARITY VERIFICATION LOOP:",
-  "  - After receiving the AI's response (Claude, ChatGPT, or Gemini), YOU MUST critically evaluate it against the task requirements:",
-  "    1. Did the external AI fully and comprehensively answer the question, or is anything omitted, vague, or generic?",
-  "    2. Are there any ambiguous architectural details, missing code blocks, syntax gaps, or unvalidated assumptions?",
-  "    3. Do you have 100% concrete, unambiguous, and copy-paste ready implementation details?",
-  "  - IF THE ANSWER IS INSUFFICIENT, UNCLEAR, INCOMPLETE, OR LACKS CRITICAL DETAILS:",
-  "    * YOU MUST NOT stop, guess, or assume missing pieces!",
-  "    * YOU MUST IMMEDIATELY ask a follow-up question in the SAME chat session by calling the consult tool again with `newChat: false`!",
-  "    * Formulate your follow-up inquiry specifically pointing out what was unclear or missing.",
-  "    * Continue this multi-turn discussion loop (`newChat: false`) until you have a 100% validated, concrete, and comprehensive solution.",
-  "  - Only once all details are completely understood and verified should you conclude the consultation and report to the user.",
   "CRITICAL ANTI-FABRICATION & TRUTH ENFORCEMENT:",
   "  - If the consult tool returns an error or failure (e.g. [Claude Error], [ChatGPT Error], [Gemini Error]):",
   "    * YOU ARE STRICTLY FORBIDDEN from inventing, fabricating, hallucinating, or guessing what the AI would have said!",
@@ -58,7 +72,7 @@ const CONSULT_MULTI_TURN_GUIDELINES = [
   "  - NEVER write custom Node.js/Playwright runner scripts in bash to automate the browser!",
   "  - Custom runner scripts leave open WebSocket handles that cause the terminal process to hang indefinitely. All CDP and browser lifecycle management is already handled safely inside the registered tools.",
   "COMPARATIVE RESPONSE STRUCTURE TO USER:",
-  "  - ONLY when the consultation SUCCEEDED and a real response was received from the external AI, follow this structure:",
+  "  - ONLY when the consultation SUCCEEDED with STATUS: FINAL, follow this structure in UZBEK:",
   "    1. 'Dastlabki reja/holat': What you originally intended to do or what was initially implemented.",
   "    2. 'Katta AI tavsiyasi': What the AI suggested with its reasoning.",
   "    3. 'Taqqoslash va baholash': Why the AI's proposal is better (e.g. handles edge cases, zero downtime, avoids conflicts).",
@@ -86,7 +100,26 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
   }
 
   // Keep browser alive for multi-turn sessions with 15-minute idle safety timeout
-  pi.on("agent_end", async () => {
+  // If an active consult loop is open (waiting for evidence or clarification), NEVER close the browser!
+  pi.on("agent_end", async (_e, ctx) => {
+    try {
+      const openLoops = await Promise.all(
+        (["claude", "chatgpt", "gemini"] as const).map(async (p) => ({
+          p,
+          loop: await ChatStore.getLoop(p),
+        })),
+      );
+      const active = openLoops.filter((x) => isLoopOpen(x.loop));
+      if (active.length > 0) {
+        if (ctx?.ui?.notify) {
+          ctx.ui.notify(
+            `⚠️ ai-consult: Faol maslahatlashuv davom etmoqda (${active.map((a) => a.p).join(", ")}) — brauzer ochiq qoldirildi.`,
+            "warning",
+          );
+        }
+        return;
+      }
+    } catch {}
     resetIdleAutoClose(15 * 60 * 1000);
   });
 
@@ -165,42 +198,321 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     return { valid: true };
   }
 
+  const EvidenceSchema = Type.Object({
+    needId: Type.Optional(Type.String({ description: "Request ID from the external AI's last reply, e.g. R1, H1" })),
+    kind: Type.Union(
+      [
+        Type.Literal("command_output"),
+        Type.Literal("file"),
+        Type.Literal("log"),
+        Type.Literal("config"),
+        Type.Literal("code"),
+        Type.Literal("clarification"),
+      ],
+      { description: "Type of evidence provided" },
+    ),
+    source: Type.String({ description: "Exact command executed, or file path[:lines]" }),
+    content: Type.String({ description: "VERBATIM output or content. Never summarize or paraphrase." }),
+    status: Type.Optional(Type.Union([Type.Literal("ok"), Type.Literal("unavailable")])),
+    note: Type.Optional(Type.String({ description: "Why unavailable, or what was truncated (English)" })),
+  });
+
+  function fenceFor(s: string): string {
+    const longest = Math.max(2, ...(s.match(/`+/g) ?? []).map((x) => x.length));
+    return "`".repeat(longest + 1);
+  }
+
+  function capSnippet(s: string, head = 12000, tail = 8000): string {
+    return s.length <= head + tail
+      ? s
+      : `${s.slice(0, head)}\n[... ${s.length - head - tail} chars truncated ...]\n${s.slice(-tail)}`;
+  }
+
+  function buildOutgoing(p: any): string {
+    const parts = [p.prompt.trim()];
+    for (const ev of p.evidence ?? []) {
+      const body = ev.status === "unavailable" ? `(unavailable: ${ev.note ?? "n/a"})` : capSnippet(ev.content);
+      const f = fenceFor(body);
+      parts.push(
+        `### EVIDENCE ${ev.needId ?? "-"} [${ev.kind}] source: ${ev.source}\n${f}text\n${body}\n${f}${
+          ev.note && ev.status !== "unavailable" ? `\nnote: ${ev.note}` : ""
+        }`,
+      );
+    }
+    parts.push(PROTOCOL_FOOTER);
+    return parts.join("\n\n");
+  }
+
+  function validateCall(p: any, loop: LoopState): string | null {
+    const newChat = p.newChat ?? (p.intent === "initial");
+    if (p.intent === "initial" && !newChat) {
+      return "intent='initial' requires newChat: true.";
+    }
+    if (p.intent && p.intent !== "initial" && newChat) {
+      return `intent='${p.intent}' requires newChat: false (continue the same chat conversation).`;
+    }
+    if (p.intent === "initial" && isLoopOpen(loop) && !p.abandonLoop) {
+      return `An active consult loop is currently open with pending requests: ${loop.pending.map((n) => n.id).join(", ")}. Continue with newChat: false (intent='evidence' or intent='clarify'), or set abandonLoop: true if the user explicitly cancelled.`;
+    }
+    if (loop.round >= MAX_ROUNDS) {
+      return `Consultation round budget exhausted (${MAX_ROUNDS} rounds). STOP looping and report to the user in Uzbek with current verified facts and remaining uncertainties.`;
+    }
+    if (p.intent === "evidence") {
+      if (!p.evidence?.length) return "intent='evidence' requires the evidence[] array.";
+      const given = new Set(p.evidence.map((e: any) => e.needId).filter(Boolean));
+      const missing = loop.pending.filter((n) => !given.has(n.id)).map((n) => n.id);
+      if (missing.length > 0) {
+        return `Unanswered requests from external AI: ${missing.join(", ")}. Provide evidence or mark with {status: "unavailable", note: "..."}.`;
+      }
+    }
+    const g = checkEnglish(p.prompt);
+    if (!g.ok) {
+      return `Prompt MUST be written in English (${g.reason}). Rewrite your prompt in English and call again. (The final response to the user remains in Uzbek).`;
+    }
+    return null;
+  }
+
+  function buildDirective(r: ParsedReply, loop: LoopState, incomplete: boolean): { status: string; text: string } {
+    const tag = `round ${loop.round}/${MAX_ROUNDS}`;
+
+    if (incomplete) {
+      return {
+        status: "INCOMPLETE",
+        text: `STATUS: INCOMPLETE (${tag}) — reply was cut off while the model was still generating.
+MANDATORY: call again with newChat:false, intent:"clarify", prompt:"Your previous reply was cut off. Continue exactly from where you stopped and end with the CONSULT_STATUS block." Do NOT start a new chat. Do NOT treat partial text as an answer.`,
+      };
+    }
+
+    if (loop.nudges === -1) {
+      return {
+        status: "STUCK",
+        text: `STATUS: STUCK (${tag}) — external AI repeated the same request(s) after evidence was already supplied.
+MANDATORY: stop looping. Report to the user in Uzbek: what was asked, what was sent, and why the external model is not converging.`,
+      };
+    }
+
+    if (r.state === "NEED_INFO") {
+      const items = r.needs
+        .map((n) => {
+          const safe =
+            n.how && n.kind === "command_output"
+              ? isReadOnlyCommand(n.how)
+                ? " [read-only: run directly]"
+                : " [NOT read-only: ask user before running]"
+              : "";
+          return `  - ID: ${n.id} [${n.kind}] ${n.what}${n.how ? `\n      Command/Path: ${n.how}${safe}` : ""}`;
+        })
+        .join("\n");
+
+      return {
+        status: "NEEDS_FOLLOWUP",
+        text: `STATUS: NEEDS_FOLLOWUP (${tag}, detected via ${r.source}) — the external AI is WAITING for additional information/evidence. Your turn is NOT finished!
+MANDATORY NEXT ACTION (do not report to the user yet, do not guess):
+1. Collect EXACTLY these items with your tools (bash/read/grep). Verbatim output only:
+${items}
+2. Call this same tool again: newChat:false, intent:"evidence", evidence:[{needId, kind, source, content}] — one entry per ID.
+3. If an item cannot be obtained, still send it with status:"unavailable" and note:"<reason>".
+4. Never run a non-read-only command without explicit user approval.`,
+      };
+    }
+
+    if (r.state === "UNCERTAIN" || r.state === "UNKNOWN" || r.lint.length > 0) {
+      const issues = r.lint.length ? r.lint.map((l) => `  - ${l}`).join("\n") : "  - no CONSULT_STATUS block or unclear state";
+      return {
+        status: "NEEDS_CLARIFICATION",
+        text: `STATUS: NEEDS_CLARIFICATION (${tag}) — reply is vague, incomplete or technically suspicious:
+${issues}
+MANDATORY NEXT ACTION: call again with newChat:false, intent:"clarify" (in English). Quote the exact vague/broken part, ask for: exact commands/configs, expected output, and which statements are verified vs assumed. Also validate code blocks locally first (bash -n, tsc --noEmit, etc.). Do NOT guess and do NOT finish the turn.`,
+      };
+    }
+
+    return {
+      status: "FINAL",
+      text: `STATUS: FINAL (${tag}) — external AI declared nothing else needed and technical lint is clean.
+NEXT: write the final report to the user in UZBEK.
+Structure:
+1. 'Dastlabki reja/holat'
+2. 'Katta AI tavsiyasi'
+3. 'Taqqoslash va baholash'
+4. 'Yakuniy tuzatilgan kod va amaliy yechim'`,
+    };
+  }
+
+  async function executeConsultation(
+    provider: "claude" | "chatgpt" | "gemini",
+    params: any,
+    options: {
+      model?: string;
+      effort?: string;
+      think?: boolean;
+      reasoning?: string;
+      timeoutSeconds?: number;
+    },
+    ctx?: any,
+  ) {
+    const validation = validateConsultPrompt(params.prompt);
+    if (!validation.valid) {
+      return {
+        content: [{ type: "text", text: validation.error! }],
+        details: { success: false, error: validation.error },
+      };
+    }
+
+    const loop = params.abandonLoop ? emptyLoop() : await ChatStore.getLoop(provider);
+    const callError = validateCall(params, loop);
+    if (callError) {
+      return {
+        content: [{ type: "text", text: `🛑 [REJECTED]: ${callError}` }],
+        details: { success: false, error: callError },
+      };
+    }
+
+    const isNew = params.newChat ?? (params.intent === "initial");
+    const outgoing = buildOutgoing(params);
+    const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(outgoing);
+
+    if (redactedCount > 0 && ctx?.ui?.notify) {
+      ctx.ui.notify(
+        `🔒 [Xavfsizlik]: So'rovdagi ${redactedCount} ta maxfiy ma'lumot (${redactedTypes.join(", ")}) avtomatik tarzda [REDACTED] qilindi!`,
+        "info",
+      );
+    }
+
+    cancelIdleAutoClose();
+    browserManager.beginOp();
+    return browserManager.serialize(async () => {
+      try {
+        let result: any;
+        if (provider === "claude") {
+          const page = await browserManager.getClaudePage(isNew);
+          result = await ClaudeProvider.consult(page, safePrompt, {
+            newChat: isNew,
+            timeoutSeconds: options.timeoutSeconds,
+            effort: options.effort ?? "High",
+            model: options.model ?? "Sonnet",
+          });
+        } else if (provider === "chatgpt") {
+          const page = await browserManager.getChatGPTPage(isNew);
+          result = await ChatGPTProvider.consult(page, safePrompt, {
+            newChat: isNew,
+            timeoutSeconds: options.timeoutSeconds,
+            think: options.think ?? true,
+          });
+        } else {
+          const page = await browserManager.getGeminiPage(isNew);
+          result = await GeminiProvider.consult(page, safePrompt, {
+            model: options.model ?? "4 Argon",
+            reasoning: (options.reasoning as any) ?? "Высокая",
+            newChat: isNew,
+            timeoutSeconds: options.timeoutSeconds,
+          });
+        }
+
+        resetIdleAutoClose(25000);
+
+        if (!result.success) {
+          if (result.rateLimitHit) {
+            return {
+              content: [{ type: "text", text: result.error || "Rate limit reached" }],
+              details: result,
+            };
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: `🛑 [${provider.toUpperCase()} XATOSI]: ${result.error || "Unknown error occurred"}\n\n[QAT'IY QOIDA]: ${provider} javob bermadi! Sizga 'Katta AI tavsiyasi'ni o'zingiz to'qib chiqarish (fabricate/fake qilish) QAT'IYAN TAQIQLANADI! Foydalanuvchiga faqat ushbu xatolikni bildiring.`,
+              },
+            ],
+            details: { success: false, error: result.error, needsLogin: result.needsLogin },
+          };
+        }
+
+        const parsed = parseReply(result.text ?? "");
+        const needsKey = parsed.needs.map((n) => `${n.kind}:${n.how ?? n.what}`).sort().join("|");
+        const stuck = params.intent === "evidence" && parsed.state === "NEED_INFO" && needsKey && needsKey === loop.lastNeedsKey;
+
+        const nextLoop: LoopState = {
+          round: (isNew ? 0 : loop.round) + 1,
+          state: parsed.state,
+          pending: parsed.state === "NEED_INFO" ? parsed.needs : [],
+          lastNeedsKey: needsKey,
+          nudges: stuck ? -1 : (isNew ? 0 : loop.nudges),
+        };
+        await ChatStore.setLoop(provider, nextLoop);
+
+        const d = buildDirective(parsed, nextLoop, false);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== AI-CONSULT RESULT === provider:${provider} chat:${result.chatUrl ?? "?"}\n${d.text}\n\n--- EXTERNAL AI RESPONSE (${result.modelUsed || provider}) ---\n${parsed.body || result.text}`,
+            },
+          ],
+          details: {
+            success: true,
+            status: d.status,
+            round: nextLoop.round,
+            pending: nextLoop.pending,
+            lint: parsed.lint,
+            parsedVia: parsed.source,
+            chatUrl: result.chatUrl,
+            modelUsed: result.modelUsed,
+          },
+        };
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes("closed") || errMsg.includes("Target page")) {
+          await browserManager.close(true);
+        }
+        return {
+          content: [{ type: "text", text: `[${provider.toUpperCase()} Error]: ${errMsg}` }],
+          details: { success: false, error: errMsg },
+        };
+      } finally {
+        browserManager.endOp();
+        resetIdleAutoClose(25000);
+      }
+    });
+  }
+
   // ── Tool: consult_claude ─────────────────────────────────────────────
   pi.registerTool({
     name: "consult_claude",
     label: "Consult Claude",
     description:
-      "Send a question or technical discussion prompt to Claude (claude.ai) in the user's logged-in browser account, wait for Claude's response, and return the answer. Supports model selection ('Sonnet', 'Opus', 'Haiku') and reasoning effort levels ('Low', 'Medium', 'High', 'Extra', 'Max').",
+      "Send a technical inquiry to Claude (claude.ai) in English. Supports model selection ('Sonnet', 'Opus', 'Haiku') and effort levels ('Low', 'Medium', 'High', 'Extra', 'Max'). Follows multi-turn evidence gathering protocol.",
     promptSnippet:
-      "Consult with Claude (claude.ai) in the user's browser account (with customizable model & effort) before writing code or making design decisions",
+      "Consult with Claude (claude.ai) in technical English before writing code or making design decisions",
     promptGuidelines: [
       "CRITICAL: When consulting Claude about work, architecture, or scripts:",
-      "  - NEVER pass the user's raw conversational command or meta-instructions into the prompt!",
-      "  - YOU MUST inspect the codebase/session, include the actual code/scripts/configurations in the prompt, and formulate an in-depth technical review request as a senior engineer.",
+      "  - Prompt MUST be in technical English. Include actual code, configs, and logs.",
       ...CONSULT_MULTI_TURN_GUIDELINES,
-      "When the user mentions consulting Claude (e.g., 'Claude bilan maslahatlash', 'ask Claude first', 'discuss with Claude'), call consult_claude before executing code changes.",
-      "If the user specifies a model (e.g. 'Claude Opus bilan', 'Haiku bilan', 'Sonnet orqali'), pass it to the model parameter.",
-      "If the user specifies an effort level (e.g., 'Low effort', 'Medium qilib', 'High bilan', 'Extra bilan', 'Max effort'), pass that value to the effort parameter. Defaults to 'High'.",
-      "If the user asks for an unavailable or paid model like Opus and the account is Free, the tool stops and returns a clear message stating the model is unavailable along with the list of available models. Inform the user and ask for instructions.",
-      "CRITICAL RATE LIMIT PROTOCOL: If consult_claude returns rateLimitHit: true or mentions that Claude limit is reached:",
-      "  - YOU MUST STOP IMMEDIATELY and NOT make code changes or call any other tool!",
-      "  - Output a clear message to the user in Uzbek: 'Claude limiti tugabdi (qayta tiklanish: <reset_time>). Loyiha asosida o'zim mustaqil davom ettiraymi yoki o'zim qilib beraymi?'",
-      "  - Present the 3 choices to the user:",
-      "      1) O'zim mustaqil qilib beray (lokal model bilan, Claude'siz)",
-      "      2) ChatGPT bilan maslahatlashish (savolni ChatGPT Think'ga yo'naltirish)",
-      "      3) Kutaman (<reset_time> gacha)",
-      "  - End your turn immediately and wait for the user's decision before making any code modifications or calling further tools!",
-      "You can have a multi-turn discussion with Claude by making follow-up calls with newChat: false.",
-      "Summarize Claude's advice clearly for the user and apply the recommended technical solution to your implementation.",
+      "When the user mentions consulting Claude (e.g., 'Claude bilan maslahatlash', 'ask Claude first'), call consult_claude.",
+      "If the user specifies a model (e.g. 'Sonnet', 'Haiku', 'Opus'), pass it to model.",
+      "If the user specifies an effort level, pass that value to effort. Defaults to 'High'.",
     ],
     parameters: Type.Object({
       prompt: Type.String({
-        description: "The question, architecture problem, or context to send to Claude",
+        description: "ENGLISH ONLY. Technical question or architecture inquiry for Claude.",
       }),
+      intent: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("initial"),
+            Type.Literal("clarify"),
+            Type.Literal("evidence"),
+            Type.Literal("verify"),
+          ],
+          {
+            description:
+              "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
+          },
+        ),
+      ),
       model: Type.Optional(
         Type.String({
-          description:
-            "Claude model name to use (e.g. 'Sonnet', 'Opus', 'Haiku'). If not available in the user's account, automatically falls back to Sonnet.",
+          description: "Claude model name: 'Sonnet', 'Opus', 'Haiku'. Defaults to 'Sonnet'.",
         }),
       ),
       effort: Type.Optional(
@@ -213,96 +525,38 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
             Type.Literal("Max"),
           ],
           {
-            description:
-              "Reasoning effort level for Claude: 'Low', 'Medium', 'High', 'Extra', or 'Max'. Default: 'High'.",
+            description: "Reasoning effort level for Claude. Default: 'High'.",
           },
         ),
       ),
       newChat: Type.Optional(
         Type.Boolean({
-          description:
-            "Start a fresh conversation (true) or continue the current conversation (false). Default: false.",
+          description: "true for intent=initial. false for all follow-up turns.",
+        }),
+      ),
+      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
+      abandonLoop: Type.Optional(
+        Type.Boolean({
+          description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
         }),
       ),
       timeoutSeconds: Type.Optional(
         Type.Number({
-          description: "Maximum seconds to wait for Claude to generate response (default: 180)",
+          description: "Maximum seconds to wait for Claude response (default: 360)",
         }),
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx?: any) {
-      const validation = validateConsultPrompt(params.prompt);
-      if (!validation.valid) {
-        return {
-          content: [{ type: "text", text: validation.error! }],
-          details: { success: false, error: validation.error },
-        };
-      }
-
-      const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(params.prompt);
-      if (redactedCount > 0 && ctx?.ui?.notify) {
-        ctx.ui.notify(
-          `🔒 [Xavfsizlik]: So'rovdagi ${redactedCount} ta maxfiy ma'lumot (${redactedTypes.join(", ")}) avtomatik tarzda [REDACTED] qilindi!`,
-          "info",
-        );
-      }
-
-      cancelIdleAutoClose();
-      browserManager.beginOp();
-      return browserManager.serialize(async () => {
-        try {
-          const page = await browserManager.getClaudePage(params.newChat ?? false);
-          const result = await ClaudeProvider.consult(page, safePrompt, {
-            newChat: params.newChat ?? false,
-            timeoutSeconds: params.timeoutSeconds,
-            effort: params.effort ?? "High",
-            model: params.model ?? "Sonnet",
-          });
-          resetIdleAutoClose(25000);
-
-          if (!result.success) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `🛑 [CLAUDE XATOSI]: ${result.error || "Unknown error occurred"}\n\n[QAT'IY QOIDA]: Claude javob bermadi! Sizga 'Katta AI tavsiyasi'ni o'zingiz to'qib chiqarish (fabricate/fake qilish) QAT'IYAN TAQIQLANADI! Foydalanuvchiga faqat ushbu xatolikni bildiring.`,
-                },
-              ],
-              details: { success: false, error: result.error, needsLogin: result.needsLogin },
-            };
-          }
-
-          const modelHeader = result.modelUsed || params.model || "Sonnet";
-          return {
-            content: [
-              {
-                type: "text",
-                text: `### Claude (${modelHeader}) Response:\n\n${result.text}${CONSULT_FOLLOWUP_NOTICE}`,
-              },
-            ],
-            details: {
-              success: true,
-              chatUrl: result.chatUrl,
-              responseLength: result.text.length,
-              modelUsed: result.modelUsed,
-              notice: result.notice,
-              effort: params.effort ?? "High",
-            },
-          };
-        } catch (err: unknown) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          if (errMsg.includes("closed") || errMsg.includes("Target page")) {
-            await browserManager.close(true);
-          }
-          return {
-            content: [{ type: "text", text: `[Claude Error]: ${errMsg}` }],
-            details: { success: false, error: errMsg },
-          };
-        } finally {
-          browserManager.endOp();
-          resetIdleAutoClose(25000);
-        }
-      });
+      return executeConsultation(
+        "claude",
+        params,
+        {
+          model: params.model ?? "Sonnet",
+          effort: params.effort ?? "High",
+          timeoutSeconds: params.timeoutSeconds,
+        },
+        ctx,
+      );
     },
   });
 
@@ -311,108 +565,65 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     name: "consult_chatgpt",
     label: "Consult ChatGPT",
     description:
-      "Send a question or technical discussion prompt to ChatGPT (chatgpt.com) in the user's logged-in browser account, wait for ChatGPT's response, and return the answer. Use this whenever the user asks to consult ChatGPT or get advice from GPT before implementing a task.",
-    promptSnippet:
-      "Consult with ChatGPT (chatgpt.com) in the user's browser account before writing code or making design decisions",
+      "Send a technical inquiry to ChatGPT (chatgpt.com) in English with Think reasoning mode. Follows multi-turn evidence gathering protocol.",
+    promptSnippet: "Consult with ChatGPT (chatgpt.com) in technical English before writing code or making design decisions",
     promptGuidelines: [
       "CRITICAL: When consulting ChatGPT about work, architecture, or scripts:",
-      "  - NEVER pass the user's raw conversational command or meta-instructions into the prompt!",
-      "  - YOU MUST inspect the codebase/session, include the actual code/scripts/configurations in the prompt, and formulate an in-depth technical review request as a senior engineer.",
+      "  - Prompt MUST be in technical English. Include actual code, configs, and logs.",
       ...CONSULT_MULTI_TURN_GUIDELINES,
-      "When the user mentions consulting ChatGPT (e.g., 'ChatGPT bilan maslahatlash', 'GPT bilan gaplash', 'ask ChatGPT first'), call consult_chatgpt before executing code changes.",
-      "ChatGPT automatically has 'Think' (reasoning) mode enabled for in-depth technical answers.",
-      "You can have a multi-turn discussion with ChatGPT by making follow-up calls with newChat: false.",
-      "Summarize ChatGPT's advice clearly for the user and apply the recommended technical solution to your implementation.",
+      "When the user mentions consulting ChatGPT (e.g., 'ChatGPT bilan maslahatlash', 'GPT bilan gaplash'), call consult_chatgpt.",
+      "ChatGPT automatically has 'Think' (reasoning) mode enabled.",
     ],
     parameters: Type.Object({
       prompt: Type.String({
-        description: "The question, architecture problem, or context to send to ChatGPT",
+        description: "ENGLISH ONLY. Technical question or architecture inquiry for ChatGPT.",
       }),
+      intent: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("initial"),
+            Type.Literal("clarify"),
+            Type.Literal("evidence"),
+            Type.Literal("verify"),
+          ],
+          {
+            description:
+              "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
+          },
+        ),
+      ),
       think: Type.Optional(
         Type.Boolean({
-          description: "Enable ChatGPT Think (reasoning) mode for smarter in-depth answers. Default: true.",
+          description: "Enable ChatGPT Think (reasoning) mode. Default: true.",
         }),
       ),
       newChat: Type.Optional(
         Type.Boolean({
-          description:
-            "Start a fresh conversation (true) or continue the current conversation (false). Default: false.",
+          description: "true for intent=initial. false for all follow-up turns.",
+        }),
+      ),
+      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
+      abandonLoop: Type.Optional(
+        Type.Boolean({
+          description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
         }),
       ),
       timeoutSeconds: Type.Optional(
         Type.Number({
-          description: "Maximum seconds to wait for ChatGPT to generate response (default: 120)",
+          description: "Maximum seconds to wait for ChatGPT response (default: 360)",
         }),
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx?: any) {
-      const validation = validateConsultPrompt(params.prompt);
-      if (!validation.valid) {
-        return {
-          content: [{ type: "text", text: validation.error! }],
-          details: { success: false, error: validation.error },
-        };
-      }
-
-      const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(params.prompt);
-      if (redactedCount > 0 && ctx?.ui?.notify) {
-        ctx.ui.notify(
-          `🔒 [Xavfsizlik]: So'rovdagi ${redactedCount} ta maxfiy ma'lumot (${redactedTypes.join(", ")}) avtomatik tarzda [REDACTED] qilindi!`,
-          "info",
-        );
-      }
-
-      cancelIdleAutoClose();
-      browserManager.beginOp();
-      return browserManager.serialize(async () => {
-        try {
-          const page = await browserManager.getChatGPTPage(params.newChat ?? false);
-          const result = await ChatGPTProvider.consult(page, safePrompt, {
-            newChat: params.newChat ?? false,
-            timeoutSeconds: params.timeoutSeconds,
-            think: params.think ?? true,
-          });
-          resetIdleAutoClose(25000);
-
-          if (!result.success) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `🛑 [CHATGPT XATOSI]: ${result.error || "Unknown error occurred"}\n\n[QAT'IY QOIDA]: ChatGPT javob bermadi! Sizga 'Katta AI tavsiyasi'ni o'zingiz to'qib chiqarish (fabricate/fake qilish) QAT'IYAN TAQIQLANADI! Foydalanuvchiga faqat ushbu xatolikni bildiring.`,
-                },
-              ],
-              details: { success: false, error: result.error, needsLogin: result.needsLogin },
-            };
-          }
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `### ChatGPT (chatgpt.com) Response:\n\n${result.text}${CONSULT_FOLLOWUP_NOTICE}`,
-              },
-            ],
-            details: {
-              success: true,
-              chatUrl: result.chatUrl,
-              responseLength: result.text.length,
-            },
-          };
-        } catch (err: unknown) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          if (errMsg.includes("closed") || errMsg.includes("Target page")) {
-            await browserManager.close(true);
-          }
-          return {
-            content: [{ type: "text", text: `[ChatGPT Error]: ${errMsg}` }],
-            details: { success: false, error: errMsg },
-          };
-        } finally {
-          browserManager.endOp();
-          resetIdleAutoClose(25000);
-        }
-      });
+      return executeConsultation(
+        "chatgpt",
+        params,
+        {
+          think: params.think ?? true,
+          timeoutSeconds: params.timeoutSeconds,
+        },
+        ctx,
+      );
     },
   });
 
@@ -421,21 +632,33 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     name: "consult_gemini",
     label: "Consult Gemini",
     description:
-      "Send a question or technical discussion prompt to Google Gemini (gemini.google.com) in the user's logged-in browser account, wait for Gemini's response, and return the answer. Supports '4 Argon', '3.1 Pro', '3.8 Flash' and reasoning levels ('Высокая', 'Средний', 'Низкая').",
-    promptSnippet: "Consult Google Gemini (Argon) in the browser before writing code or making design decisions",
+      "Send a technical inquiry to Google Gemini (gemini.google.com) in English with Gemini 4 Argon deep reasoning. Follows multi-turn evidence gathering protocol.",
+    promptSnippet: "Consult Google Gemini (Argon) in technical English before writing code or making design decisions",
     promptGuidelines: [
       "CRITICAL: When consulting Gemini (Argon) about work, architecture, or scripts:",
-      "  - NEVER pass the user's raw conversational command or meta-instructions into the prompt!",
-      "  - YOU MUST inspect the codebase/session, include the actual code/scripts/configurations in the prompt, and formulate an in-depth technical review request as a senior engineer.",
+      "  - Prompt MUST be in technical English. Include actual code, configs, and logs.",
       ...CONSULT_MULTI_TURN_GUIDELINES,
       "Gemini 4 Argon is Google's newest flagship reasoning model for complex code, math, and architecture.",
       "Supports reasoning levels: 'Высокая' (Deep/Глубокий), 'Средний', 'Низкая'. Default is 'Высокая'.",
-      "You can have a multi-turn discussion with Gemini by making follow-up calls with newChat: false.",
     ],
     parameters: Type.Object({
       prompt: Type.String({
-        description: "The question, architecture problem, or context to send to Gemini",
+        description: "ENGLISH ONLY. Technical question or architecture inquiry for Gemini.",
       }),
+      intent: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("initial"),
+            Type.Literal("clarify"),
+            Type.Literal("evidence"),
+            Type.Literal("verify"),
+          ],
+          {
+            description:
+              "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
+          },
+        ),
+      ),
       model: Type.Optional(
         Type.String({
           description: "Gemini model name: '4 Argon', '3.1 Pro', '3.8 Flash', '3.5 Flash-Lite'. Default: '4 Argon'.",
@@ -445,91 +668,38 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
         Type.Union(
           [Type.Literal("Высокая"), Type.Literal("Средний"), Type.Literal("Низкая")],
           {
-            description: "Reasoning level for Gemini 4 Argon: 'Высокая' (Deep/Глубокий), 'Средний', 'Низкая'. Default: 'Высокая'.",
+            description: "Reasoning level for Gemini 4 Argon: 'Высокая' (Deep), 'Средний', 'Низкая'. Default: 'Высокая'.",
           },
         ),
       ),
       newChat: Type.Optional(
         Type.Boolean({
-          description: "Start a fresh conversation (true) or continue current (false). Default: false.",
+          description: "true for intent=initial. false for all follow-up turns.",
+        }),
+      ),
+      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
+      abandonLoop: Type.Optional(
+        Type.Boolean({
+          description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
         }),
       ),
       timeoutSeconds: Type.Optional(
         Type.Number({
-          description: "Maximum seconds to wait for Gemini response (default: 180)",
+          description: "Maximum seconds to wait for Gemini response (default: 360)",
         }),
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx?: any) {
-      const validation = validateConsultPrompt(params.prompt);
-      if (!validation.valid) {
-        return {
-          content: [{ type: "text", text: validation.error! }],
-          details: { success: false, error: validation.error },
-        };
-      }
-
-      const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(params.prompt);
-      if (redactedCount > 0 && ctx?.ui?.notify) {
-        ctx.ui.notify(
-          `🔒 [Xavfsizlik]: So'rovdagi ${redactedCount} ta maxfiy ma'lumot (${redactedTypes.join(", ")}) avtomatik tarzda [REDACTED] qilindi!`,
-          "info",
-        );
-      }
-
-      cancelIdleAutoClose();
-      browserManager.beginOp();
-      return await browserManager.serialize(async () => {
-        try {
-          const page = await browserManager.getGeminiPage(params.newChat ?? false);
-          const result = await GeminiProvider.consult(page, safePrompt, {
-            model: params.model ?? "4 Argon",
-            reasoning: params.reasoning ?? "Высокая",
-            newChat: params.newChat ?? false,
-            timeoutSeconds: params.timeoutSeconds,
-          });
-          resetIdleAutoClose(25000);
-
-          if (!result.success) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `🛑 [GEMINI XATOSI]: ${result.error || "Unknown error occurred"}\n\n[QAT'IY QOIDA]: Gemini javob bermadi! Sizga 'Katta AI tavsiyasi'ni o'zingiz to'qib chiqarish (fabricate/fake qilish) QAT'IYAN TAQIQLANADI! Foydalanuvchiga faqat ushbu xatolikni bildiring.`,
-                },
-              ],
-              details: { success: false, error: result.error },
-            };
-          }
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `### Gemini (${result.modelUsed ?? "4 Argon"}, ${result.reasoningUsed ?? "Высокая"}) Response:\n\n${result.text}${CONSULT_FOLLOWUP_NOTICE}`,
-              },
-            ],
-            details: {
-              success: true,
-              modelUsed: result.modelUsed,
-              reasoningUsed: result.reasoningUsed,
-              responseLength: result.text.length,
-            },
-          };
-        } catch (err: unknown) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          if (errMsg.includes("closed") || errMsg.includes("Target page")) {
-            await browserManager.close(true);
-          }
-          return {
-            content: [{ type: "text", text: `[Gemini Error]: ${errMsg}` }],
-            details: { success: false, error: errMsg },
-          };
-        } finally {
-          browserManager.endOp();
-          resetIdleAutoClose(25000);
-        }
-      });
+      return executeConsultation(
+        "gemini",
+        params,
+        {
+          model: params.model ?? "4 Argon",
+          reasoning: params.reasoning ?? "Высокая",
+          timeoutSeconds: params.timeoutSeconds,
+        },
+        ctx,
+      );
     },
   });
 
@@ -537,14 +707,27 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "consult_ai",
     label: "Consult AI",
-    description: "Consult either Claude or ChatGPT in the user's browser account.",
-    promptSnippet: "Consult Claude or ChatGPT in the browser",
+    description: "Consult either Claude, ChatGPT, or Gemini in technical English.",
+    promptSnippet: "Consult Claude, ChatGPT, or Gemini in technical English",
     parameters: Type.Object({
       provider: Type.Union([Type.Literal("claude"), Type.Literal("chatgpt"), Type.Literal("gemini")], {
         description: "Which AI to consult ('claude', 'chatgpt', or 'gemini')",
       }),
-      prompt: Type.String({ description: "Question or discussion prompt" }),
-      model: Type.Optional(Type.String({ description: "Model name (e.g. 'Sonnet', 'Opus', 'Haiku')" })),
+      prompt: Type.String({ description: "ENGLISH ONLY technical prompt" }),
+      intent: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("initial"),
+            Type.Literal("clarify"),
+            Type.Literal("evidence"),
+            Type.Literal("verify"),
+          ],
+          {
+            description: "Consultation intent",
+          },
+        ),
+      ),
+      model: Type.Optional(Type.String({ description: "Model name" })),
       effort: Type.Optional(
         Type.Union(
           [
@@ -555,81 +738,26 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
             Type.Literal("Max"),
           ],
           {
-            description: "Reasoning effort level for Claude (Low, Medium, High, Extra, Max). Default: High.",
+            description: "Reasoning effort level for Claude",
           },
         ),
       ),
       newChat: Type.Optional(Type.Boolean({ description: "Start new conversation" })),
+      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
+      abandonLoop: Type.Optional(Type.Boolean({ description: "Abandon active loop" })),
       timeoutSeconds: Type.Optional(Type.Number({ description: "Timeout in seconds" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx?: any) {
-      const validation = validateConsultPrompt(params.prompt);
-      if (!validation.valid) {
-        return {
-          content: [{ type: "text", text: validation.error! }],
-          details: { success: false, error: validation.error },
-        };
-      }
-
-      const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(params.prompt);
-      if (redactedCount > 0 && ctx?.ui?.notify) {
-        ctx.ui.notify(
-          `🔒 [Xavfsizlik]: So'rovdagi ${redactedCount} ta maxfiy ma'lumot (${redactedTypes.join(", ")}) avtomatik tarzda [REDACTED] qilindi!`,
-          "info",
-        );
-      }
-
-      if (params.provider === "claude") {
-        const page = await browserManager.getClaudePage(params.newChat ?? false);
-        const res = await ClaudeProvider.consult(page, safePrompt, {
-          newChat: params.newChat ?? false,
+      return executeConsultation(
+        params.provider,
+        params,
+        {
+          model: params.model,
+          effort: params.effort,
           timeoutSeconds: params.timeoutSeconds,
-          effort: params.effort ?? "High",
-          model: params.model ?? "Sonnet",
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: res.success
-                ? `### Claude Response [Effort: ${params.effort ?? "High"}]:\n\n${res.text}`
-                : `[Error]: ${res.error}`,
-            },
-          ],
-          details: res,
-        };
-      } else if (params.provider === "gemini") {
-        const page = await browserManager.getGeminiPage(params.newChat ?? false);
-        const res = await GeminiProvider.consult(page, safePrompt, {
-          newChat: params.newChat ?? false,
-          timeoutSeconds: params.timeoutSeconds,
-          model: params.model ?? "4 Argon",
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: res.success ? `### Gemini Response:\n\n${res.text}` : `[Error]: ${res.error}`,
-            },
-          ],
-          details: res,
-        };
-      } else {
-        const page = await browserManager.getChatGPTPage(params.newChat ?? false);
-        const res = await ChatGPTProvider.consult(page, safePrompt, {
-          newChat: params.newChat ?? false,
-          timeoutSeconds: params.timeoutSeconds,
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: res.success ? `### ChatGPT Response:\n\n${res.text}` : `[Error]: ${res.error}`,
-            },
-          ],
-          details: res,
-        };
-      }
+        },
+        ctx,
+      );
     },
   });
 
