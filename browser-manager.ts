@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn, execSync } from "node:child_process";
+import net from "node:net";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 
 export interface BrowserStatus {
@@ -140,6 +141,76 @@ export class BrowserManager {
     return null;
   }
 
+  private getActivePortFilePath(): string {
+    return join(this.profileDir, ".active-port");
+  }
+
+  private readSavedPort(): number | null {
+    try {
+      const file = this.getActivePortFilePath();
+      if (existsSync(file)) {
+        const val = parseInt(readFileSync(file, "utf8").trim(), 10);
+        if (!isNaN(val) && val > 0 && val < 65536) return val;
+      }
+    } catch {}
+    return null;
+  }
+
+  private saveActivePort(port: number): void {
+    try {
+      writeFileSync(this.getActivePortFilePath(), port.toString(), "utf8");
+    } catch {}
+  }
+
+  private async isPortBindable(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const srv = net.createServer();
+      srv.unref();
+      srv.once("error", () => resolve(false));
+      srv.listen(port, "127.0.0.1", () => {
+        srv.close(() => resolve(true));
+      });
+    });
+  }
+
+  private async findFreePort(preferred = [19222, 29222, 39222, 49222, 9222]): Promise<number> {
+    for (const p of preferred) {
+      if (await this.isPortBindable(p)) {
+        return p;
+      }
+    }
+    // Fallback: ask OS for an ephemeral free port
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.unref();
+      srv.once("error", reject);
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address() as net.AddressInfo;
+        srv.close(() => resolve(addr.port));
+      });
+    });
+  }
+
+  private cleanupStaleZombies(): void {
+    if (process.platform !== "win32") return;
+    try {
+      const output = execSync(
+        'wmic process where "name=\'chrome.exe\'" get processid,commandline /format:csv',
+        { encoding: "utf8", timeout: 4000 }
+      );
+      const lines = output.split("\n").filter((l) => l.includes(this.profileDir));
+      for (const l of lines) {
+        const lastComma = l.lastIndexOf(",");
+        const pid = l.slice(lastComma + 1).trim();
+        if (/^\d+$/.test(pid)) {
+          try {
+            execSync(`taskkill /F /PID ${pid}`, { stdio: "ignore" });
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
   private async isCdpAvailable(port = this.cdpPort): Promise<boolean> {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json/version`, {
@@ -168,12 +239,26 @@ export class BrowserManager {
       }
     }
 
-    // 1. Check candidate CDP ports (19222, 9222, or custom port)
-    const candidatePorts = Array.from(new Set([this.cdpPort, 19222, 9222]));
+    // 1. Check candidate CDP ports (env override -> saved .active-port -> candidate ports)
+    const saved = this.readSavedPort();
+    const candidatePorts = Array.from(
+      new Set(
+        [
+          process.env.PI_AI_CONSULT_CDP_PORT ? parseInt(process.env.PI_AI_CONSULT_CDP_PORT, 10) : null,
+          saved,
+          this.cdpPort,
+          19222,
+          29222,
+          9222,
+        ].filter((p): p is number => typeof p === "number" && p > 0)
+      )
+    );
+
     for (const port of candidatePorts) {
       if (await this.isCdpAvailable(port)) {
         try {
           this.cdpPort = port;
+          this.saveActivePort(port);
           this.browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
           const contexts = this.browser.contexts();
           this.context = contexts[0] ?? (await this.browser.newContext());
@@ -192,7 +277,14 @@ export class BrowserManager {
       }
     }
 
-    // 2. Launch Chrome with remote-debugging-port so all concurrent sessions can share it
+    // 2. If no CDP port responded, clean up any stale zombies locking the profile
+    this.cleanupStaleZombies();
+
+    // 3. Dynamically find a guaranteed free, unreserved port
+    const freePort = await this.findFreePort();
+    this.cdpPort = freePort;
+
+    // 4. Launch Chrome with remote-debugging-port on the verified free port
     const chromePath = this.findChromePath();
     if (chromePath) {
       try {
@@ -218,7 +310,8 @@ export class BrowserManager {
           if (await this.isCdpAvailable(this.cdpPort)) break;
         }
 
-        if (await this.isCdpAvailable()) {
+        if (await this.isCdpAvailable(this.cdpPort)) {
+          this.saveActivePort(this.cdpPort);
           this.browser = await chromium.connectOverCDP(`http://127.0.0.1:${this.cdpPort}`);
           const contexts = this.browser.contexts();
           this.context = contexts[0] ?? (await this.browser.newContext());
@@ -233,7 +326,7 @@ export class BrowserManager {
           return this.context;
         }
       } catch (err) {
-        console.warn("[ai-consult] Spawning Chrome with CDP failed:", err);
+        console.warn("[ai-consult] Spawning Chrome with dynamic CDP failed:", err);
       }
     }
 
