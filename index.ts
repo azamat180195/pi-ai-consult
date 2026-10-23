@@ -79,12 +79,17 @@ const CONSULT_MULTI_TURN_GUIDELINES = [
   "      * If a claim can be verified locally with a read-only command (grep, pfctl -sr, dry-run, test, nginx -t, bash -n), RUN IT LOCALLY instead of merely arguing. Feed the output in Phase 'evidence'.",
   "  - RED-TEAM GATE (Phase: 'redteam'):",
   "      * For high-risk T2 tasks before presenting to the user, run a Red Team check: 'Assume this fails in production within 24h. What are the top 3 failure modes, detection signals, and mitigations?'.",
+  "CHAT CONTINUITY DIRECTIVE (PREVENT DUPLICATE CHATS):",
+  "  - DEFAULT IS CONTINUATION: By default, the harness continues in the active conversation thread for this project.",
+  "  - Always continue in the same chat thread (omit newChat or pass newChat: false) for: follow-ups, clarifications, related tasks, iterative refinements, and ongoing discussions in the same project/repository.",
+  "  - Continuing the chat preserves conversational context (the external AI remembers earlier files, architecture, decisions) and avoids wasting tokens and messaging limits.",
+  "  - Pass newChat: true ONLY when starting a completely different, unrelated topic or when the user explicitly commands a fresh chat ('yangi chat och', 'toza chatdan boshla').",
   "DETERMINISTIC MULTI-TURN EVIDENCE & CLARIFICATION LOOP:",
   "  - Every consultation call must specify an `intent` or `phase`:",
-  "      * 'initial' / 'brief': starts a new consultation topic (requires newChat: true).",
-  "      * 'clarify' / 'challenge': asks for clarification or challenges questionable assumptions (requires newChat: false).",
+  "      * 'initial' / 'brief': consultation topic/brief.",
+  "      * 'clarify' / 'challenge': asks for clarification or challenges questionable assumptions (uses newChat: false).",
   "      * 'evidence': answers the external AI's requests for data/files/logs (requires newChat: false and evidence[]).",
-  "      * 'verify' / 'redteam': tests failure modes and double-checks final conclusion (requires newChat: false).",
+  "      * 'verify' / 'redteam': tests failure modes and double-checks final conclusion (uses newChat: false).",
   "  - Inspect the returned `STATUS:` in the tool result:",
   "      * 'NEEDS_FOLLOWUP': The external AI is waiting for specific logs, config files, or command outputs. Your turn is NOT finished! Do not summarize to the user yet! Immediately collect the requested items using your bash/read/grep tools, and call the consult tool again with `intent: 'evidence'`, `newChat: false`, and `evidence: [...]`.",
   "      * 'NEEDS_CLARIFICATION': The response was vague, incomplete, or technically suspicious. Do NOT guess! Call again with `intent: 'clarify'`, `newChat: false`, quote the exact unclear part, and request exact configurations.",
@@ -344,16 +349,7 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     return parts.join("\n\n");
   }
 
-  function validateCall(p: any, loop: LoopState): string | null {
-    const isNew = p.newChat ?? (p.intent === "initial" || p.phase === "brief");
-    if ((p.intent === "initial" || p.phase === "brief") && !isNew) {
-      return "intent='initial' or phase='brief' requires newChat: true.";
-    }
-    if ((p.intent && p.intent !== "initial") || (p.phase && p.phase !== "brief")) {
-      if (isNew) {
-        return `Follow-up calls (intent='${p.intent || p.phase}') require newChat: false to continue the same chat conversation.`;
-      }
-    }
+  function validateCall(p: any, loop: LoopState, isNew: boolean): string | null {
     if (isNew && isLoopOpen(loop) && !p.abandonLoop) {
       return `An active consult loop is currently open with pending requests: ${loop.pending.map((n) => n.id).join(", ")}. Continue with newChat: false (intent='evidence', 'challenge', or 'clarify'), or set abandonLoop: true if the user explicitly cancelled.`;
     }
@@ -488,8 +484,23 @@ Structure:
     open_issues: Type.Optional(Type.Array(OpenIssueSchema, { maxItems: 6 })),
     newChat: Type.Optional(
       Type.Boolean({
-        description: "true for intent=initial or phase=brief. false for all follow-up turns.",
+        description:
+          "false (default): continues in the active conversation thread for this project. Pass true ONLY if starting a brand new topic or user explicitly asked for a fresh chat.",
       }),
+    ),
+    newChatReason: Type.Optional(
+      Type.Union(
+        [
+          Type.Literal("no_active_record"),
+          Type.Literal("user_directive"),
+          Type.Literal("new_workstream"),
+          Type.Literal("saturated"),
+          Type.Literal("thread_broken"),
+        ],
+        {
+          description: "Reason for starting a new chat thread when newChat is true",
+        },
+      ),
     ),
     evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
     abandonLoop: Type.Optional(
@@ -524,8 +535,35 @@ Structure:
       };
     }
 
+    const lastChat = await ChatStore.getLastChat(provider);
+    const hasHealthyChat = !!lastChat?.chatUrl && (lastChat.turns ?? 0) < 35;
+
+    let isNew = false;
+    let overridden = false;
+    if (params.newChat === true) {
+      if (params.newChatReason || !hasHealthyChat) {
+        isNew = true;
+      } else {
+        // If agent requested newChat without reason, but healthy active chat exists, auto-continue!
+        isNew = false;
+        overridden = true;
+      }
+    } else if (params.newChat === false) {
+      isNew = false;
+    } else {
+      // Omitted: default to continue if healthy chat exists, otherwise new
+      isNew = !hasHealthyChat;
+    }
+
+    if (overridden && ctx?.ui?.notify) {
+      ctx.ui.notify(
+        `💬 [ai-consult]: Loyiha bo'yicha mavjud faol chat davom ettirilmoqda (${provider})`,
+        "info",
+      );
+    }
+
     const loop = params.abandonLoop ? emptyLoop() : await ChatStore.getLoop(provider);
-    const callError = validateCall(params, loop);
+    const callError = validateCall(params, loop, isNew);
     if (callError) {
       return {
         content: [{ type: "text", text: `🛑 [REJECTED]: ${callError}` }],
@@ -533,7 +571,6 @@ Structure:
       };
     }
 
-    const isNew = params.newChat ?? (params.intent === "initial" || params.phase === "brief");
     const outgoing = buildOutgoing(params, loop.round + 1);
     const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(outgoing);
 
