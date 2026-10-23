@@ -96,6 +96,38 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     await browserManager.close();
   });
 
+  // Intercept & block agents from writing or running ad-hoc browser automation scripts
+  pi.on("tool_call", async (event) => {
+    if (event.toolName === "bash") {
+      const cmd = String(event.input?.command || "");
+      if (
+        /node\s+.*(?:claude|chatgpt|gemini|consult|ai-consult).*\.js/i.test(cmd) ||
+        /playwright|connectOverCDP|remote-debugging/i.test(cmd)
+      ) {
+        return {
+          block: true,
+          reason:
+            "🛑 [TAQIQLANGAN]: Brauzer avtomatizatsiyasi uchun alohida Node.js/bash skripti yozish yoki ishga tushirish qat'iyan man etiladi! Bunday skriptlar WebSocket ulanishlarini ochiq qoldirib terminalni 5 daqiqagacha muzlatib (hang qilib) qo'yadi. Buning o'rniga ro'yxatdan o'tgan rasmiy `consult_claude`, `consult_chatgpt` yoki `consult_gemini` asboblaridan to'g'ridan-to'g'ri foydalaning!",
+        };
+      }
+    }
+
+    if (event.toolName === "write" || event.toolName === "edit") {
+      const path = String(event.input?.path || "");
+      const content = String(event.input?.content || "");
+      if (
+        /(?:claude|chatgpt|gemini|consult).*\.js$/i.test(path) &&
+        /(?:browser-manager|claude-provider|chatgpt-provider|gemini-provider|connectOverCDP)/i.test(content)
+      ) {
+        return {
+          block: true,
+          reason:
+            "🛑 [TAQIQLANGAN]: Brauzer avtomatizatsiyasi uchun alohida skript fayllari yaratish man etiladi! Buning o'rniga Pi tizimida mavjud bo'lgan rasmiy `consult_claude`, `consult_chatgpt` yoki `consult_gemini` asboblarini chaqiring.",
+        };
+      }
+    }
+  });
+
   // Helper: Guard against lazy agents echoing raw user conversational commands to the AI
   function validateConsultPrompt(prompt: string): { valid: boolean; error?: string } {
     const p = prompt.trim().toLowerCase();

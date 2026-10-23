@@ -28,6 +28,25 @@ export class BrowserManager {
   private opQueue: Promise<unknown> = Promise.resolve();
   private gen = 0;
   private idleTimer?: NodeJS.Timeout;
+  private standaloneWatchdog?: NodeJS.Timeout;
+
+  public isStandaloneProcess(): boolean {
+    return !process.env.PI_SESSION_ID && !process.env.PI_SESSION_DIR && !process.env.PI_CODING_AGENT;
+  }
+
+  public touchStandaloneWatchdog(timeoutMs = 3000): void {
+    if (!this.isStandaloneProcess()) return;
+    if (this.standaloneWatchdog) {
+      clearTimeout(this.standaloneWatchdog);
+    }
+    this.standaloneWatchdog = setTimeout(async () => {
+      try {
+        await this.closeNow();
+      } catch {}
+      process.exit(0);
+    }, timeoutMs);
+    this.standaloneWatchdog.unref();
+  }
 
   constructor() {
     if (process.env.PI_AI_CONSULT_PROFILE) {
