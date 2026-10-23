@@ -400,6 +400,12 @@ export class BrowserManager {
       page = await ctx.newPage();
     }
 
+    if (page.url() === "about:blank" || page.url() === "") {
+      try {
+        await page.goto("https://claude.ai/new", { waitUntil: "commit", timeout: 30000 });
+      } catch {}
+    }
+
     this.claudePage = page;
     await this.claudePage.bringToFront();
     return this.claudePage;
@@ -446,6 +452,12 @@ export class BrowserManager {
       page = await ctx.newPage();
     }
 
+    if (page.url() === "about:blank" || page.url() === "") {
+      try {
+        await page.goto("https://chatgpt.com", { waitUntil: "commit", timeout: 30000 });
+      } catch {}
+    }
+
     this.chatgptPage = page;
     await this.chatgptPage.bringToFront();
     return this.chatgptPage;
@@ -488,6 +500,12 @@ export class BrowserManager {
       page = pages[0];
     } else {
       page = await ctx.newPage();
+    }
+
+    if (page.url() === "about:blank" || page.url() === "") {
+      try {
+        await page.goto("https://gemini.google.com/app", { waitUntil: "commit", timeout: 30000 });
+      } catch {}
     }
 
     this.geminiPage = page;

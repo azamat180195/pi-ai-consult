@@ -578,7 +578,7 @@ export class ClaudeProvider {
     let inputLocator;
     try {
       inputLocator = page.locator(inputSelector).first();
-      await inputLocator.waitFor({ state: "visible", timeout: 15000 });
+      await inputLocator.waitFor({ state: "visible", timeout: 35000 });
     } catch {
       return {
         success: false,

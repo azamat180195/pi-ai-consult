@@ -47,8 +47,14 @@ const CONSULT_MULTI_TURN_GUIDELINES = [
   "    * Formulate your follow-up inquiry specifically pointing out what was unclear or missing.",
   "    * Continue this multi-turn discussion loop (`newChat: false`) until you have a 100% validated, concrete, and comprehensive solution.",
   "  - Only once all details are completely understood and verified should you conclude the consultation and report to the user.",
+  "CRITICAL ANTI-FABRICATION & TRUTH ENFORCEMENT:",
+  "  - If the consult tool returns an error or failure (e.g. [Claude Error], [ChatGPT Error], [Gemini Error]):",
+  "    * YOU ARE STRICTLY FORBIDDEN from inventing, fabricating, hallucinating, or guessing what the AI would have said!",
+  "    * YOU MUST NEVER generate a fake 'Katta AI tavsiyasi' when the external AI failed to respond!",
+  "    * You MUST immediately and honestly inform the user of the exact error and stop!",
+  "    * Attempting to fake or simulate the external AI's response is considered a critical security and truthfulness violation.",
   "COMPARATIVE RESPONSE STRUCTURE TO USER:",
-  "  - When presenting the final answer to the user, you MUST follow this structure:",
+  "  - ONLY when the consultation SUCCEEDED and a real response was received from the external AI, follow this structure:",
   "    1. 'Dastlabki reja/holat': What you originally intended to do or what was initially implemented.",
   "    2. 'Katta AI tavsiyasi': What the AI suggested with its reasoning.",
   "    3. 'Taqqoslash va baholash': Why the AI's proposal is better (e.g. handles edge cases, zero downtime, avoids conflicts).",
@@ -223,7 +229,7 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `[Claude Error]: ${result.error || "Unknown error occurred"}`,
+                  text: `🛑 [CLAUDE XATOSI]: ${result.error || "Unknown error occurred"}\n\n[QAT'IY QOIDA]: Claude javob bermadi! Sizga 'Katta AI tavsiyasi'ni o'zingiz to'qib chiqarish (fabricate/fake qilish) QAT'IYAN TAQIQLANADI! Foydalanuvchiga faqat ushbu xatolikni bildiring.`,
                 },
               ],
               details: { success: false, error: result.error, needsLogin: result.needsLogin },
@@ -337,7 +343,7 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `[ChatGPT Error]: ${result.error || "Unknown error occurred"}`,
+                  text: `🛑 [CHATGPT XATOSI]: ${result.error || "Unknown error occurred"}\n\n[QAT'IY QOIDA]: ChatGPT javob bermadi! Sizga 'Katta AI tavsiyasi'ni o'zingiz to'qib chiqarish (fabricate/fake qilish) QAT'IYAN TAQIQLANADI! Foydalanuvchiga faqat ushbu xatolikni bildiring.`,
                 },
               ],
               details: { success: false, error: result.error, needsLogin: result.needsLogin },
@@ -450,7 +456,12 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
 
           if (!result.success) {
             return {
-              content: [{ type: "text", text: `[Gemini Error]: ${result.error || "Unknown error occurred"}` }],
+              content: [
+                {
+                  type: "text",
+                  text: `🛑 [GEMINI XATOSI]: ${result.error || "Unknown error occurred"}\n\n[QAT'IY QOIDA]: Gemini javob bermadi! Sizga 'Katta AI tavsiyasi'ni o'zingiz to'qib chiqarish (fabricate/fake qilish) QAT'IYAN TAQIQLANADI! Foydalanuvchiga faqat ushbu xatolikni bildiring.`,
+                },
+              ],
               details: { success: false, error: result.error },
             };
           }
