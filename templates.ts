@@ -20,12 +20,25 @@ export interface BriefData {
   unknowns?: string[];
 }
 
+export type DoubtType = "AMBIGUITY" | "GAP" | "CONFLICT" | "UNVERIFIABLE" | "RISK";
+
+export interface DoubtTicket {
+  id?: string;
+  type: DoubtType;
+  quote_or_claim: string;       // Exact line, command, or claim from external AI
+  trigger_and_effect?: string;  // Concrete failure scenario: trigger -> consequence
+  decision_impact: string;      // How the answer will change our concrete action/code
+  question: string;             // Specific, non-rhetorical technical inquiry
+}
+
 export interface OpenIssue {
   id: string;
   claim: string;
   status: "open" | "verified" | "accepted_risk" | "rejected";
   evidence_level?: "ran_locally" | "source_or_docs" | "reasoning" | "assertion";
   challenge_question?: string;
+  ticket_type?: DoubtType;
+  decision_impact?: string;
 }
 
 export function formatBrief(b: BriefData): string {
@@ -83,24 +96,24 @@ export function formatChallenge(
   const issuesList = issues
     .map(
       (iss) =>
-        `[${iss.id}] Claim: "${iss.claim}"\nQuestion/Challenge: ${
+        `[${iss.id}] Type: ${iss.ticket_type || "DOUBT"}\nClaim: "${iss.claim}"\nQuestion: ${
           iss.challenge_question ||
-          "Why did you choose this over alternatives, and how does it prevent race conditions / downtime?"
-        }`,
+          "What is the exact mechanism and how does it prevent failure?"
+        }${iss.decision_impact ? `\nDecision Impact (Why it matters): ${iss.decision_impact}` : ""}`,
     )
     .join("\n\n");
 
-  return `Review Round ${round} - Critical Challenge & Adversarial Review.
-Answer each open point separately by ID. Do NOT agree just to be polite; if my concern is unfounded, state why with concrete technical evidence.
+  return `Review Round ${round} - Need-Driven Technical Inquiry & Risk Verification.
+Answer each open point separately by ID. Be direct and technical; do not hedge or flatter.
 
 ${issuesList}
 
-${customQuestions ? `Additional Architectural Questions:\n${customQuestions}\n` : ""}
+${customQuestions ? `Additional Technical Questions:\n${customQuestions}\n` : ""}
 For each item, provide:
 - Direct Answer
-- Evidence (official docs, source code reference, exact command to run)
+- Evidence (official documentation, source code reference, or exact command to run)
 - Confidence (0-100%)
-- What would change your mind or prove this wrong`;
+- What would prove this wrong or change your recommendation`;
 }
 
 export function formatRedTeam(finalPlan: string): string {
