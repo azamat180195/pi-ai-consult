@@ -37,17 +37,41 @@ import {
   type ParsedReply,
 } from "./protocol.js";
 
+import {
+  formatBrief,
+  formatChallenge,
+  formatRedTeam,
+  type BriefData,
+  type OpenIssue,
+} from "./templates.js";
+
 const CONSULT_MULTI_TURN_GUIDELINES = [
   "LANGUAGE ENFORCEMENT - ENGLISH ONLY FOR PROMPTS:",
   "  - All prompts sent to external AIs (Claude, ChatGPT, Gemini) MUST be written in technical English only!",
   "  - Code, logs, error messages, and file paths remain verbatim.",
   "  - The FINAL explanation/report to the user must be delivered in Uzbek.",
+  "TRIAGE & SOCRATIC PEER-REVIEW ARCHITECTURE:",
+  "  - Classify tasks into tiers: T0 (minor/local/reversible -> no consult needed), T1 (design ambiguity with low blast radius -> 1 round), T2 (production, irreversible, security, DB migration, firewall/network, auth, secrets, hot path, deploy/CI -> FULL Socratic Peer-Review protocol).",
+  "  - PRE-CONSULTATION DEEP ANALYSIS (Phase: 'brief'):",
+  "      * Before asking the external AI, inspect the codebase and server state yourself with read/bash.",
+  "      * Fill the `brief` parameter with: 1-5 hotspots (location, why it is hard, evidence), your initial hypothesis with confidence %, alternatives already considered, and conditions under which it would be wrong/falsified.",
+  "      * Never send a lazy or raw user prompt.",
+  "  - SOCRATIC CHALLENGE & PUSHBACK (Phase: 'challenge'):",
+  "      * Treat every external AI proposal as an untrusted recommendation that must be defended.",
+  "      * Probe failure modes: 'Why did you choose library/method X instead of Y?', race conditions, memory/socket leaks, downtime risk, and behavior under the stated production traffic.",
+  "      * Batch all challenge questions into ONE message (max 5 questions) to respect message quotas.",
+  "      * If the external AI reverses its position without providing new evidence, question the reversal.",
+  "  - EVIDENCE HIERARCHY:",
+  "      * ran_locally > source_or_docs > reasoning > assertion.",
+  "      * If a claim can be verified locally with a read-only command (grep, pfctl -sr, dry-run, test, nginx -t, bash -n), RUN IT LOCALLY instead of merely arguing. Feed the output in Phase 'evidence'.",
+  "  - RED-TEAM GATE (Phase: 'redteam'):",
+  "      * Before presenting to the user, run a Red Team check: 'Assume this fails in production within 24h. What are the top 3 failure modes, detection signals, and mitigations?'.",
   "DETERMINISTIC MULTI-TURN EVIDENCE & CLARIFICATION LOOP:",
-  "  - Every consultation call must specify an `intent`:",
-  "      * 'initial': starts a new consultation topic (requires newChat: true).",
-  "      * 'clarify': asks for clarification on vague, incomplete, or broken parts (requires newChat: false).",
+  "  - Every consultation call must specify an `intent` or `phase`:",
+  "      * 'initial' / 'brief': starts a new consultation topic (requires newChat: true).",
+  "      * 'clarify' / 'challenge': asks for clarification or challenges questionable assumptions (requires newChat: false).",
   "      * 'evidence': answers the external AI's requests for data/files/logs (requires newChat: false and evidence[]).",
-  "      * 'verify': asks the external AI to double-check its final recommendations (requires newChat: false).",
+  "      * 'verify' / 'redteam': tests failure modes and double-checks final conclusion (requires newChat: false).",
   "  - Inspect the returned `STATUS:` in the tool result:",
   "      * 'NEEDS_FOLLOWUP': The external AI is waiting for specific logs, config files, or command outputs. Your turn is NOT finished! Do not summarize to the user yet! Immediately collect the requested items using your bash/read/grep tools, and call the consult tool again with `intent: 'evidence'`, `newChat: false`, and `evidence: [...]`.",
   "      * 'NEEDS_CLARIFICATION': The response was vague, incomplete, or technically suspicious. Do NOT guess! Call again with `intent: 'clarify'`, `newChat: false`, quote the exact unclear part, and request exact configurations.",
@@ -71,12 +95,15 @@ const CONSULT_MULTI_TURN_GUIDELINES = [
   "  - ALWAYS use the built-in consultation tools (consult_claude, consult_chatgpt, consult_gemini) to interact with external AI models!",
   "  - NEVER write custom Node.js/Playwright runner scripts in bash to automate the browser!",
   "  - Custom runner scripts leave open WebSocket handles that cause the terminal process to hang indefinitely. All CDP and browser lifecycle management is already handled safely inside the registered tools.",
-  "COMPARATIVE RESPONSE STRUCTURE TO USER:",
-  "  - ONLY when the consultation SUCCEEDED with STATUS: FINAL, follow this structure in UZBEK:",
-  "    1. 'Dastlabki reja/holat': What you originally intended to do or what was initially implemented.",
-  "    2. 'Katta AI tavsiyasi': What the AI suggested with its reasoning.",
-  "    3. 'Taqqoslash va baholash': Why the AI's proposal is better (e.g. handles edge cases, zero downtime, avoids conflicts).",
-  "    4. 'Yakuniy tuzatilgan kod va amaliy yechim': The complete, fixed code ready to deploy.",
+  "FINAL COMPREHENSIVE UZBEK REPORT STRUCTURE (7 Sections):",
+  "  - ONLY when the consultation SUCCEEDED with STATUS: FINAL, present the report in UZBEK structured as follows:",
+  "    1. 'Qaror': 1-2 sentences summarizing the definitive solution.",
+  "    2. 'Nega aynan shu': Core justification backed by concrete evidence (commands run, source references).",
+  "    3. 'Rad etilgan variantlar': Table comparing alternatives: | Variant | Nega rad etildi | Qachon to'g'ri bo'lardi |.",
+  "    4. 'Xatarlar va qanday yopildi': Table of failure modes: | Xatar (race/leak/downtime/yuk) | Yechim | Dalil darajasi |.",
+  "    5. 'Qoldiq xavf': Residual risks that could not be verified locally + canary monitoring metrics.",
+  "    6. 'Qo'llash va Rollback': Exact copy-paste commands and rollback procedure.",
+  "    7. 'Maslahat tarixi': Summary of consultation rounds and how consensus was established.",
 ];
 
 export default function aiConsultExtension(pi: ExtensionAPI) {
@@ -217,6 +244,46 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     note: Type.Optional(Type.String({ description: "Why unavailable, or what was truncated (English)" })),
   });
 
+  const HotspotSchema = Type.Object({
+    location: Type.String({ description: "file:line, service, or component where the problem resides" }),
+    why_hard: Type.String({ description: "Why this part is complex, risky, or a bottleneck" }),
+    evidence: Type.String({ description: "Log snippet, grep output, or metric demonstrating the problem" }),
+  });
+
+  const HypothesisSchema = Type.Object({
+    statement: Type.String({ description: "Your initial proposed direction or solution" }),
+    confidence: Type.Integer({ minimum: 0, maximum: 100, description: "Your initial confidence percentage (0-100)" }),
+    alternatives_considered: Type.Array(Type.String(), { description: "Other approaches you considered" }),
+    falsified_if: Type.String({ description: "Conditions under which your proposal would fail or be wrong" }),
+  });
+
+  const BriefSchema = Type.Object({
+    goal: Type.String({ description: "Exact objective of the task" }),
+    environment: Type.String({ description: "OS, versions, traffic, hardware, constraints" }),
+    hotspots: Type.Array(HotspotSchema, { minItems: 1, maxItems: 5, description: "Challenging parts analyzed by you" }),
+    hypothesis: HypothesisSchema,
+    verified_locally: Type.Optional(Type.Array(Type.String(), { description: "Facts already verified locally" })),
+    unknowns: Type.Optional(Type.Array(Type.String(), { description: "Unknowns or un-testable assumptions" })),
+  });
+
+  const OpenIssueSchema = Type.Object({
+    id: Type.String({ description: "Issue identifier, e.g. I1, I2" }),
+    claim: Type.String({ description: "The external AI's claim or recommendation being evaluated" }),
+    status: Type.Union(
+      [Type.Literal("open"), Type.Literal("verified"), Type.Literal("accepted_risk"), Type.Literal("rejected")],
+      { description: "Current evaluation status" },
+    ),
+    evidence_level: Type.Optional(
+      Type.Union([
+        Type.Literal("ran_locally"),
+        Type.Literal("source_or_docs"),
+        Type.Literal("reasoning"),
+        Type.Literal("assertion"),
+      ]),
+    ),
+    challenge_question: Type.Optional(Type.String({ description: "Specific challenging question to ask" })),
+  });
+
   function fenceFor(s: string): string {
     const longest = Math.max(2, ...(s.match(/`+/g) ?? []).map((x) => x.length));
     return "`".repeat(longest + 1);
@@ -228,8 +295,17 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
       : `${s.slice(0, head)}\n[... ${s.length - head - tail} chars truncated ...]\n${s.slice(-tail)}`;
   }
 
-  function buildOutgoing(p: any): string {
-    const parts = [p.prompt.trim()];
+  function buildOutgoing(p: any, round = 1): string {
+    let mainPrompt = p.prompt?.trim() || "";
+    if (p.phase === "brief" && p.brief) {
+      mainPrompt = formatBrief(p.brief) + (p.prompt ? `\n\nAdditional Technical Details:\n${p.prompt}` : "");
+    } else if (p.phase === "challenge" && p.open_issues?.length) {
+      mainPrompt = formatChallenge(round, p.open_issues, p.prompt);
+    } else if (p.phase === "redteam") {
+      mainPrompt = formatRedTeam(p.prompt || "Review the complete implementation plan.");
+    }
+
+    const parts = [mainPrompt];
     for (const ev of p.evidence ?? []) {
       const body = ev.status === "unavailable" ? `(unavailable: ${ev.note ?? "n/a"})` : capSnippet(ev.content);
       const f = fenceFor(body);
@@ -244,15 +320,17 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
   }
 
   function validateCall(p: any, loop: LoopState): string | null {
-    const newChat = p.newChat ?? (p.intent === "initial");
-    if (p.intent === "initial" && !newChat) {
-      return "intent='initial' requires newChat: true.";
+    const isNew = p.newChat ?? (p.intent === "initial" || p.phase === "brief");
+    if ((p.intent === "initial" || p.phase === "brief") && !isNew) {
+      return "intent='initial' or phase='brief' requires newChat: true.";
     }
-    if (p.intent && p.intent !== "initial" && newChat) {
-      return `intent='${p.intent}' requires newChat: false (continue the same chat conversation).`;
+    if ((p.intent && p.intent !== "initial") || (p.phase && p.phase !== "brief")) {
+      if (isNew) {
+        return `Follow-up calls (intent='${p.intent || p.phase}') require newChat: false to continue the same chat conversation.`;
+      }
     }
-    if (p.intent === "initial" && isLoopOpen(loop) && !p.abandonLoop) {
-      return `An active consult loop is currently open with pending requests: ${loop.pending.map((n) => n.id).join(", ")}. Continue with newChat: false (intent='evidence' or intent='clarify'), or set abandonLoop: true if the user explicitly cancelled.`;
+    if (isNew && isLoopOpen(loop) && !p.abandonLoop) {
+      return `An active consult loop is currently open with pending requests: ${loop.pending.map((n) => n.id).join(", ")}. Continue with newChat: false (intent='evidence', 'challenge', or 'clarify'), or set abandonLoop: true if the user explicitly cancelled.`;
     }
     if (loop.round >= MAX_ROUNDS) {
       return `Consultation round budget exhausted (${MAX_ROUNDS} rounds). STOP looping and report to the user in Uzbek with current verified facts and remaining uncertainties.`;
@@ -265,7 +343,8 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
         return `Unanswered requests from external AI: ${missing.join(", ")}. Provide evidence or mark with {status: "unavailable", note: "..."}.`;
       }
     }
-    const g = checkEnglish(p.prompt);
+    const textToCheck = p.prompt || p.brief?.goal || p.brief?.hypothesis?.statement || "";
+    const g = checkEnglish(textToCheck);
     if (!g.ok) {
       return `Prompt MUST be written in English (${g.reason}). Rewrite your prompt in English and call again. (The final response to the user remains in Uzbek).`;
     }
@@ -331,12 +410,74 @@ MANDATORY NEXT ACTION: call again with newChat:false, intent:"clarify" (in Engli
       text: `STATUS: FINAL (${tag}) — external AI declared nothing else needed and technical lint is clean.
 NEXT: write the final report to the user in UZBEK.
 Structure:
-1. 'Dastlabki reja/holat'
-2. 'Katta AI tavsiyasi'
-3. 'Taqqoslash va baholash'
-4. 'Yakuniy tuzatilgan kod va amaliy yechim'`,
+1. 'Qaror' (1-2 gap: nima qilinadi)
+2. 'Nega aynan shu' (Asosiy sabablar, dalil bilan)
+3. 'Rad etilgan variantlar' (Jadval: Variant | Nega rad etildi | Qachon to'g'ri bo'lardi)
+4. 'Xatarlar va qanday yopildi' (Jadval: Xatar (race/leak/downtime/yuk) | Yechim | Dalil darajasi)
+5. 'Qoldiq xavf' (Lokal tekshirib bo'lmadi + kuzatiladigan metrika)
+6. 'Qo'llash va Rollback' (Aniq buyruqlar va rollback qadamlari)
+7. 'Maslahat tarixi' (Raundlar, kelishilgan yechim)`,
     };
   }
+
+  const consultParamsBase = {
+    prompt: Type.Optional(
+      Type.String({
+        description: "ENGLISH ONLY. Technical question or architecture inquiry. Code/logs stay verbatim.",
+      }),
+    ),
+    intent: Type.Optional(
+      Type.Union(
+        [
+          Type.Literal("initial"),
+          Type.Literal("clarify"),
+          Type.Literal("evidence"),
+          Type.Literal("verify"),
+        ],
+        {
+          description:
+            "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
+        },
+      ),
+    ),
+    phase: Type.Optional(
+      Type.Union(
+        [
+          Type.Literal("brief"),
+          Type.Literal("challenge"),
+          Type.Literal("evidence"),
+          Type.Literal("redteam"),
+        ],
+        {
+          description:
+            "brief=initial deep analysis with brief object. challenge=push back against AI assumptions with open_issues. evidence=answer data requests. redteam=final 24h failure simulation before reporting.",
+        },
+      ),
+    ),
+    tier: Type.Optional(
+      Type.Union([Type.Literal("T0"), Type.Literal("T1"), Type.Literal("T2")], {
+        description: "Triage tier: T0=minor/local, T1=design ambiguity/low risk, T2=production/irreversible/hotpath/security.",
+      }),
+    ),
+    brief: Type.Optional(BriefSchema),
+    open_issues: Type.Optional(Type.Array(OpenIssueSchema, { maxItems: 6 })),
+    newChat: Type.Optional(
+      Type.Boolean({
+        description: "true for intent=initial or phase=brief. false for all follow-up turns.",
+      }),
+    ),
+    evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
+    abandonLoop: Type.Optional(
+      Type.Boolean({
+        description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
+      }),
+    ),
+    timeoutSeconds: Type.Optional(
+      Type.Number({
+        description: "Maximum seconds to wait for response (default: 360)",
+      }),
+    ),
+  };
 
   async function executeConsultation(
     provider: "claude" | "chatgpt" | "gemini",
@@ -350,7 +491,7 @@ Structure:
     },
     ctx?: any,
   ) {
-    const validation = validateConsultPrompt(params.prompt);
+    const validation = validateConsultPrompt(params.prompt, !!params.brief);
     if (!validation.valid) {
       return {
         content: [{ type: "text", text: validation.error! }],
@@ -367,8 +508,8 @@ Structure:
       };
     }
 
-    const isNew = params.newChat ?? (params.intent === "initial");
-    const outgoing = buildOutgoing(params);
+    const isNew = params.newChat ?? (params.intent === "initial" || params.phase === "brief");
+    const outgoing = buildOutgoing(params, loop.round + 1);
     const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(outgoing);
 
     if (redactedCount > 0 && ctx?.ui?.notify) {
@@ -481,7 +622,7 @@ Structure:
     name: "consult_claude",
     label: "Consult Claude",
     description:
-      "Send a technical inquiry to Claude (claude.ai) in English. Supports model selection ('Sonnet', 'Opus', 'Haiku') and effort levels ('Low', 'Medium', 'High', 'Extra', 'Max'). Follows multi-turn evidence gathering protocol.",
+      "Send a technical inquiry to Claude (claude.ai) in English with Socratic review support. Supports model selection ('Sonnet', 'Opus', 'Haiku') and effort levels ('Low', 'Medium', 'High', 'Extra', 'Max').",
     promptSnippet:
       "Consult with Claude (claude.ai) in technical English before writing code or making design decisions",
     promptGuidelines: [
@@ -493,23 +634,7 @@ Structure:
       "If the user specifies an effort level, pass that value to effort. Defaults to 'High'.",
     ],
     parameters: Type.Object({
-      prompt: Type.String({
-        description: "ENGLISH ONLY. Technical question or architecture inquiry for Claude.",
-      }),
-      intent: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("initial"),
-            Type.Literal("clarify"),
-            Type.Literal("evidence"),
-            Type.Literal("verify"),
-          ],
-          {
-            description:
-              "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
-          },
-        ),
-      ),
+      ...consultParamsBase,
       model: Type.Optional(
         Type.String({
           description: "Claude model name: 'Sonnet', 'Opus', 'Haiku'. Defaults to 'Sonnet'.",
@@ -528,22 +653,6 @@ Structure:
             description: "Reasoning effort level for Claude. Default: 'High'.",
           },
         ),
-      ),
-      newChat: Type.Optional(
-        Type.Boolean({
-          description: "true for intent=initial. false for all follow-up turns.",
-        }),
-      ),
-      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
-      abandonLoop: Type.Optional(
-        Type.Boolean({
-          description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
-        }),
-      ),
-      timeoutSeconds: Type.Optional(
-        Type.Number({
-          description: "Maximum seconds to wait for Claude response (default: 360)",
-        }),
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx?: any) {
@@ -565,7 +674,7 @@ Structure:
     name: "consult_chatgpt",
     label: "Consult ChatGPT",
     description:
-      "Send a technical inquiry to ChatGPT (chatgpt.com) in English with Think reasoning mode. Follows multi-turn evidence gathering protocol.",
+      "Send a technical inquiry to ChatGPT (chatgpt.com) in English with Think reasoning mode and Socratic review support.",
     promptSnippet: "Consult with ChatGPT (chatgpt.com) in technical English before writing code or making design decisions",
     promptGuidelines: [
       "CRITICAL: When consulting ChatGPT about work, architecture, or scripts:",
@@ -575,42 +684,10 @@ Structure:
       "ChatGPT automatically has 'Think' (reasoning) mode enabled.",
     ],
     parameters: Type.Object({
-      prompt: Type.String({
-        description: "ENGLISH ONLY. Technical question or architecture inquiry for ChatGPT.",
-      }),
-      intent: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("initial"),
-            Type.Literal("clarify"),
-            Type.Literal("evidence"),
-            Type.Literal("verify"),
-          ],
-          {
-            description:
-              "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
-          },
-        ),
-      ),
+      ...consultParamsBase,
       think: Type.Optional(
         Type.Boolean({
           description: "Enable ChatGPT Think (reasoning) mode. Default: true.",
-        }),
-      ),
-      newChat: Type.Optional(
-        Type.Boolean({
-          description: "true for intent=initial. false for all follow-up turns.",
-        }),
-      ),
-      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
-      abandonLoop: Type.Optional(
-        Type.Boolean({
-          description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
-        }),
-      ),
-      timeoutSeconds: Type.Optional(
-        Type.Number({
-          description: "Maximum seconds to wait for ChatGPT response (default: 360)",
         }),
       ),
     }),
@@ -632,33 +709,17 @@ Structure:
     name: "consult_gemini",
     label: "Consult Gemini",
     description:
-      "Send a technical inquiry to Google Gemini (gemini.google.com) in English with Gemini 4 Argon deep reasoning. Follows multi-turn evidence gathering protocol.",
+      "Send a technical inquiry to Google Gemini (gemini.google.com) in English with Gemini 4 Argon deep reasoning and Socratic review support.",
     promptSnippet: "Consult Google Gemini (Argon) in technical English before writing code or making design decisions",
     promptGuidelines: [
       "CRITICAL: When consulting Gemini (Argon) about work, architecture, or scripts:",
       "  - Prompt MUST be in technical English. Include actual code, configs, and logs.",
       ...CONSULT_MULTI_TURN_GUIDELINES,
       "Gemini 4 Argon is Google's newest flagship reasoning model for complex code, math, and architecture.",
-      "Supports reasoning levels: 'Высокая' (Deep/Глубокий), 'Средний', 'Низкая'. Default is 'Высокая'.",
+      "Supports reasoning levels: 'Высокая' (Deep/Глубокий), 'Средний', 'Нizкая'. Default is 'Высокая'.",
     ],
     parameters: Type.Object({
-      prompt: Type.String({
-        description: "ENGLISH ONLY. Technical question or architecture inquiry for Gemini.",
-      }),
-      intent: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("initial"),
-            Type.Literal("clarify"),
-            Type.Literal("evidence"),
-            Type.Literal("verify"),
-          ],
-          {
-            description:
-              "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
-          },
-        ),
-      ),
+      ...consultParamsBase,
       model: Type.Optional(
         Type.String({
           description: "Gemini model name: '4 Argon', '3.1 Pro', '3.8 Flash', '3.5 Flash-Lite'. Default: '4 Argon'.",
@@ -668,25 +729,9 @@ Structure:
         Type.Union(
           [Type.Literal("Высокая"), Type.Literal("Средний"), Type.Literal("Низкая")],
           {
-            description: "Reasoning level for Gemini 4 Argon: 'Высокая' (Deep), 'Средний', 'Низкая'. Default: 'Высокая'.",
+            description: "Reasoning level for Gemini 4 Argon: 'Высокая' (Deep), 'Средний', 'Нizкая'. Default: 'Высокая'.",
           },
         ),
-      ),
-      newChat: Type.Optional(
-        Type.Boolean({
-          description: "true for intent=initial. false for all follow-up turns.",
-        }),
-      ),
-      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
-      abandonLoop: Type.Optional(
-        Type.Boolean({
-          description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
-        }),
-      ),
-      timeoutSeconds: Type.Optional(
-        Type.Number({
-          description: "Maximum seconds to wait for Gemini response (default: 360)",
-        }),
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx?: any) {
@@ -707,26 +752,13 @@ Structure:
   pi.registerTool({
     name: "consult_ai",
     label: "Consult AI",
-    description: "Consult either Claude, ChatGPT, or Gemini in technical English.",
+    description: "Consult either Claude, ChatGPT, or Gemini in technical English with Socratic review support.",
     promptSnippet: "Consult Claude, ChatGPT, or Gemini in technical English",
     parameters: Type.Object({
       provider: Type.Union([Type.Literal("claude"), Type.Literal("chatgpt"), Type.Literal("gemini")], {
         description: "Which AI to consult ('claude', 'chatgpt', or 'gemini')",
       }),
-      prompt: Type.String({ description: "ENGLISH ONLY technical prompt" }),
-      intent: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("initial"),
-            Type.Literal("clarify"),
-            Type.Literal("evidence"),
-            Type.Literal("verify"),
-          ],
-          {
-            description: "Consultation intent",
-          },
-        ),
-      ),
+      ...consultParamsBase,
       model: Type.Optional(Type.String({ description: "Model name" })),
       effort: Type.Optional(
         Type.Union(
@@ -742,10 +774,6 @@ Structure:
           },
         ),
       ),
-      newChat: Type.Optional(Type.Boolean({ description: "Start new conversation" })),
-      evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
-      abandonLoop: Type.Optional(Type.Boolean({ description: "Abandon active loop" })),
-      timeoutSeconds: Type.Optional(Type.Number({ description: "Timeout in seconds" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx?: any) {
       return executeConsultation(
