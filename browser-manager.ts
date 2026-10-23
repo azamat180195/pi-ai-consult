@@ -18,7 +18,7 @@ export class BrowserManager {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private mode: "cdp" | "persistent" | "disconnected" = "disconnected";
-  private cdpPort = 9222;
+  private cdpPort = 19222;
   private profileDir = join(homedir(), ".pi", "agent", "ai-consult-profile");
   private claudePage: Page | null = null;
   private chatgptPage: Page | null = null;
@@ -33,7 +33,9 @@ export class BrowserManager {
       this.profileDir = process.env.PI_AI_CONSULT_PROFILE;
     }
     if (process.env.PI_AI_CONSULT_CDP_PORT) {
-      this.cdpPort = parseInt(process.env.PI_AI_CONSULT_CDP_PORT, 10) || 9222;
+      this.cdpPort = parseInt(process.env.PI_AI_CONSULT_CDP_PORT, 10) || 19222;
+    } else {
+      this.cdpPort = 19222;
     }
   }
 
@@ -138,9 +140,9 @@ export class BrowserManager {
     return null;
   }
 
-  private async isCdpAvailable(): Promise<boolean> {
+  private async isCdpAvailable(port = this.cdpPort): Promise<boolean> {
     try {
-      const res = await fetch(`http://127.0.0.1:${this.cdpPort}/json/version`, {
+      const res = await fetch(`http://127.0.0.1:${port}/json/version`, {
         signal: AbortSignal.timeout(600),
       });
       return res.ok;
@@ -166,25 +168,27 @@ export class BrowserManager {
       }
     }
 
-    // 1. Check if Chrome CDP port is already available (from another active Pi session)
-    const cdpAvailable = await this.isCdpAvailable();
-
-    if (cdpAvailable) {
-      try {
-        this.browser = await chromium.connectOverCDP(`http://127.0.0.1:${this.cdpPort}`);
-        const contexts = this.browser.contexts();
-        this.context = contexts[0] ?? (await this.browser.newContext());
-        this.context.on("close", () => {
-          this.context = null;
-          this.browser = null;
-          this.claudePage = null;
-          this.chatgptPage = null;
-          this.geminiPage = null;
-        });
-        this.mode = "cdp";
-        return this.context;
-      } catch (err) {
-        console.warn("[ai-consult] CDP connection to running Chrome failed:", err);
+    // 1. Check candidate CDP ports (19222, 9222, or custom port)
+    const candidatePorts = Array.from(new Set([this.cdpPort, 19222, 9222]));
+    for (const port of candidatePorts) {
+      if (await this.isCdpAvailable(port)) {
+        try {
+          this.cdpPort = port;
+          this.browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+          const contexts = this.browser.contexts();
+          this.context = contexts[0] ?? (await this.browser.newContext());
+          this.context.on("close", () => {
+            this.context = null;
+            this.browser = null;
+            this.claudePage = null;
+            this.chatgptPage = null;
+            this.geminiPage = null;
+          });
+          this.mode = "cdp";
+          return this.context;
+        } catch (err) {
+          console.warn(`[ai-consult] CDP connection to port ${port} failed:`, err);
+        }
       }
     }
 
@@ -196,7 +200,6 @@ export class BrowserManager {
           chromePath,
           [
             `--remote-debugging-port=${this.cdpPort}`,
-            `--remote-debugging-address=127.0.0.1`,
             `--user-data-dir=${this.profileDir}`,
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
@@ -212,7 +215,7 @@ export class BrowserManager {
         // Wait up to 10 seconds for CDP port to become ready
         for (let i = 0; i < 40; i++) {
           await new Promise((r) => setTimeout(r, 250));
-          if (await this.isCdpAvailable()) break;
+          if (await this.isCdpAvailable(this.cdpPort)) break;
         }
 
         if (await this.isCdpAvailable()) {

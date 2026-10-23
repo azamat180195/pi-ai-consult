@@ -48,8 +48,8 @@ The local agent receives both the explanation AND the complete source code forma
 - Generates unique turn nonces (`[ref <hex>]`) to anchor observations strictly to the current turn, completely avoiding previous conversation turns.
 - **Crash & Power-Cut Recovery**: Active chat URLs and nonces are persisted in `~/.pi/agent/ai-consult-last-chat.json`. If power cuts or the agent restarts, it reconnects to the exact chat and harvests the completed response in seconds without resending prompts or burning message quotas.
 
-### 6. ⚡ Multi-Session Parallelism (CDP on Port 9222)
-- Runs over Chrome DevTools Protocol (`--remote-debugging-port=9222`).
+### 6. ⚡ Multi-Session Parallelism (CDP on Port 19222 / 9222)
+- Runs over Chrome DevTools Protocol (`--remote-debugging-port=19222`). Auto-detects ports and avoids Windows Hyper-V port exclusion conflicts.
 - Multiple Pi agent sessions run concurrently in parallel without locking Chrome profiles or killing each other's browser tabs.
 
 ### 7. 🩺 Self-Diagnostic Doctor Command
@@ -92,7 +92,7 @@ npm install
 
 ### Step 2: Log In to Your Accounts
 
-Run the login commands from inside Pi (or launch Chrome with `--remote-debugging-port=9222`):
+Run the login commands from inside Pi (or launch Chrome with `--remote-debugging-port=19222`):
 
 ```bash
 # In Pi terminal:
@@ -117,7 +117,7 @@ Output:
   Pi Core Version: 1.3.0
   Extension Directory: ~/.pi/agent/extensions/ai-consult
   Playwright Driver: Installed & Active
-  Browser Mode: CDP (remote debugging on port 9222)
+  Browser Mode: CDP (remote debugging on port 19222)
   Update Survivability: Isolated user extension directory (100% update-proof)
   Summary: All systems healthy and ready!
 ```
