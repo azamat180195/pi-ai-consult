@@ -82,10 +82,19 @@ const sha = (s: string, n = 12) =>
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function findGitRoot(start: string): string | null {
+function findProjectRoot(start: string): string | null {
   let p = start;
   for (let i = 0; i < 15; i++) {
-    if (fs.existsSync(path.join(p, ".git"))) return p;
+    if (
+      fs.existsSync(path.join(p, ".git")) ||
+      fs.existsSync(path.join(p, ".pi")) ||
+      fs.existsSync(path.join(p, ".ai-consult.json")) ||
+      fs.existsSync(path.join(p, "package.json")) ||
+      fs.existsSync(path.join(p, "Cargo.toml")) ||
+      fs.existsSync(path.join(p, "pyproject.toml"))
+    ) {
+      return p;
+    }
     const up = path.dirname(p);
     if (up === p) break;
     p = up;
@@ -93,11 +102,22 @@ function findGitRoot(start: string): string | null {
   return null;
 }
 
+export function getProjectLabel(cwd = process.cwd()): string {
+  if (process.env.AI_CONSULT_SCOPE) return process.env.AI_CONSULT_SCOPE;
+  try {
+    const root = findProjectRoot(cwd) ?? cwd;
+    const base = path.basename(root);
+    return base || "default";
+  } catch {
+    return "default";
+  }
+}
+
 export function getScopeKey(cwd = process.cwd()): string {
   if (process.env.AI_CONSULT_SCOPE) return sha(process.env.AI_CONSULT_SCOPE);
   try {
     let p = fs.realpathSync.native ? fs.realpathSync.native(cwd) : fs.realpathSync(cwd);
-    p = findGitRoot(p) ?? p;
+    p = findProjectRoot(p) ?? p;
     if (process.platform === "win32") p = p.toLowerCase().replace(/\\/g, "/");
     return sha(p, 10);
   } catch {
@@ -182,6 +202,10 @@ export class ChatStore {
 
   public static getScope(cwd = process.cwd()): string {
     return getScopeKey(cwd);
+  }
+
+  public static getProjectLabel(cwd = process.cwd()): string {
+    return getProjectLabel(cwd);
   }
 
   public static async getLastChat(

@@ -555,9 +555,23 @@ Structure:
       isNew = !hasHealthyChat;
     }
 
+    const projectLabel = ChatStore.getProjectLabel();
+    const shortChat = lastChat?.chatUrl ? lastChat.chatUrl.split("/").pop() : "";
+
     if (overridden && ctx?.ui?.notify) {
       ctx.ui.notify(
-        `💬 [ai-consult]: Loyiha bo'yicha mavjud faol chat davom ettirilmoqda (${provider})`,
+        `⚠ [ai-consult]: newChat so'rovi rad etildi (faol chat mavjud) — ${provider.toUpperCase()} suhbati davom ettirilmoqda (${projectLabel})`,
+        "info",
+      );
+    } else if (!isNew && ctx?.ui?.notify) {
+      ctx.ui.notify(
+        `↻ [ai-consult]: ${provider.toUpperCase()} chat DAVOM ettirildi · loyiha: ${projectLabel} · ${shortChat} · ${(lastChat?.turns ?? 0) + 1}-navbat`,
+        "info",
+      );
+    } else if (isNew && ctx?.ui?.notify) {
+      const reasonLabel = params.newChatReason ?? "yangi loyiha";
+      ctx.ui.notify(
+        `✚ [ai-consult]: YANGI ${provider.toUpperCase()} chat ochilmoqda · loyiha: ${projectLabel} · sabab: ${reasonLabel}`,
         "info",
       );
     }
@@ -571,7 +585,7 @@ Structure:
       };
     }
 
-    const outgoing = buildOutgoing(params, loop.round + 1);
+    const outgoing = (isNew ? `[ai-consult · ${projectLabel}]\n\n` : "") + buildOutgoing(params, loop.round + 1);
     const { text: safePrompt, redactedCount, redactedTypes } = SecretRedactor.redact(outgoing);
 
     if (redactedCount > 0 && ctx?.ui?.notify) {
