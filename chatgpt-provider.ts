@@ -624,7 +624,10 @@ export class ChatGPTProvider {
         }
 
         // Check for standalone Retry/Try again button in error cards
-        const retryBtn = document.querySelector('button:has-text("Retry"), button:has-text("Try again")');
+        const retryBtn = Array.from(document.querySelectorAll("button")).find((b) => {
+          const t = (b.innerText || b.textContent || "").trim();
+          return t === "Retry" || t === "Try again" || t.includes("Retry") || t.includes("Try again");
+        });
         if (retryBtn) {
           const container = (retryBtn as HTMLElement).closest('div[class*="border"], div[class*="error"]') || retryBtn.parentElement;
           return {
