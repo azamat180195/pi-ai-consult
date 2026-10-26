@@ -17,29 +17,44 @@ export interface ConsultResult {
 
 export class ClaudeProvider {
   public static parseResetAt(raw: string, now = new Date()): { until: number; approx: boolean; resetLabel: string } {
-    const h = /(\d+)\s*(?:hours?|hrs?|h)\b/i.exec(raw)?.[1];
-    const m = /(\d+)\s*(?:minutes?|mins?)\b/i.exec(raw)?.[1];
-    if (/\bin\b/i.test(raw) && (h || m)) {
+    const text = (raw || "").trim();
+
+    // 1. Relative duration: e.g. "in 2 hours", "in 45 minutes", "in 1h 20m"
+    const h = /(\d+)\s*(?:hours?|hrs?|h)\b/i.exec(text)?.[1];
+    const m = /(\d+)\s*(?:minutes?|mins?|m)\b/i.exec(text)?.[1];
+    if (/\bin\b/i.test(text) && (h || m)) {
       const until = now.getTime() + (+(h ?? 0) * 60 + +(m ?? 0)) * 60_000;
       const d = new Date(until);
       const resetLabel = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
       return { until, approx: false, resetLabel };
     }
 
-    const t = /\b(?:at|until|resets?)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(raw);
-    if (t) {
-      let hh = +t[1];
-      const mm = +(t[2] ?? 0);
-      const ap = t[3]?.toLowerCase();
+    // 2. Explicit clock time: e.g. "5:10 PM", "5:10pm", "17:10", "until 5:10 PM", "at 5:10 PM", "will reset at 5:10 PM"
+    const clockMatch =
+      /(?:(?:at|until|resets?|returns?|after)\s+)?(\d{1,2}):(\d{2})\s*(am|pm)?\b/i.exec(text) ||
+      /\b(?:(?:at|until|resets?|returns?|after)\s+)?(\d{1,2})\s*(am|pm)\b/i.exec(text);
+
+    if (clockMatch) {
+      let hh = parseInt(clockMatch[1], 10);
+      const mm = clockMatch[2] ? parseInt(clockMatch[2], 10) : 0;
+      const ap = clockMatch[3]?.toLowerCase();
+
       if (ap === "pm" && hh < 12) hh += 12;
       if (ap === "am" && hh === 12) hh = 0;
+
       const d = new Date(now);
       d.setHours(hh, mm, 0, 0);
-      if (d <= now) d.setDate(d.getDate() + 1);
+
+      // If the target time has already passed today (by more than 5 minutes), assume tomorrow
+      if (d.getTime() < now.getTime() - 5 * 60_000) {
+        d.setDate(d.getDate() + 1);
+      }
+
       const resetLabel = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
       return { until: d.getTime(), approx: false, resetLabel };
     }
 
+    // 3. Fallback: 5 hours from now
     const fallbackUntil = now.getTime() + 5 * 3600_000;
     const d = new Date(fallbackUntil);
     const resetLabel = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -174,24 +189,25 @@ export class ClaudeProvider {
   ): Promise<{ isLimit: boolean; resetTime?: string; rawMessage?: string }> {
     try {
       const pageInfo = await page.evaluate(() => {
-        // 1. Modal dialogs and portal root
+        // 1. Modal dialogs, portal root, toasts, banners
         const dialogEls = Array.from(
-          document.querySelectorAll('div[role="dialog"], #portal-root, [class*="modal"]')
+          document.querySelectorAll(
+            'div[role="dialog"], #portal-root, [class*="modal"], div[class*="toast"], div[class*="banner"], div[class*="warning"], div[class*="alert"], [role="alert"], [role="status"]',
+          ),
         );
         const dialogTexts = dialogEls.map((d) => (d as HTMLElement).innerText).filter(Boolean);
 
         // 2. Alert and error elements
         const errorEls = Array.from(
           document.querySelectorAll(
-            '[data-testid*="error"], [role="alert"], .text-danger, .font-danger, div[class*="banner"], div[class*="warning"]',
+            '[data-testid*="error"], [data-testid*="limit"], .text-danger, .font-danger, div[class*="notification"]',
           ),
         );
         const errorTexts = errorEls.map((e) => (e as HTMLElement).innerText).filter(Boolean);
 
-        // 3. Composer warning banner (excluding the contenteditable input itself!)
-        const composerAlert =
-          (document.querySelector('form [role="alert"], fieldset [role="alert"], [data-testid*="limit"], [data-testid*="error"]') as HTMLElement)
-            ?.innerText || "";
+        // 3. Composer warning banner and elements directly above or within composer
+        const composerParent = document.querySelector('div.ProseMirror')?.closest('fieldset, form, div[class*="composer"], div[class*="input"]')?.parentElement;
+        const composerAlert = (composerParent as HTMLElement)?.innerText || "";
 
         return {
           dialogTexts,
@@ -207,15 +223,15 @@ export class ClaudeProvider {
       ].join("\n");
 
       const patterns = [
-        /hit\s+your\s+(?:\d+-hour\s+)?message\s+limit/i,
+        /will\s+reset\s+at\s+([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
+        /resets?\s+(?:at|in)\s*([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
+        /returns\s+at\s+([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
+        /out\s+of\s+(?:free\s+)?messages\s*(?:until|at)?\s*([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
+        /reached\s+your\s+(?:messaging\s+|message\s+|free\s+usage\s+)?limit\s*(?:until|at)?\s*([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
+        /hit\s+your\s+(?:limit\s+for\s+Claude\s+messages|(?:\d+-hour\s+)?message\s+limit)/i,
         /5-hour\s+message\s+limit/i,
         /upgrade\s+to\s+keep\s+chatting/i,
-        /resets\s+at\s+([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
-        /reached\s+your\s+(?:messaging\s+|message\s+|free\s+usage\s+)?limit\s*(?:until|at)?\s*([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
-        /out\s+of\s+(?:free\s+)?messages\s*(?:until|at)?\s*([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
         /try\s+again\s+(?:after|at)\s*([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
-        /limit\s+resets?\s+(?:at|in)\s*([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i,
-        /reached\s+your\s+(?:messaging|message)\s+limit/i,
         /you\s+are\s+out\s+of\s+messages/i,
         /free\s+tier\s+message\s+limit\s+reached/i,
       ];
@@ -235,9 +251,11 @@ export class ClaudeProvider {
         }
       }
 
-      // Explicitly check for 'resets at <time>'
+      // If limit is detected, comprehensively scan combinedText for any explicit time
       if (isLimit && !resetTime) {
-        const timeMatch = combinedText.match(/resets\s+at\s+([0-9:AMPampm\s]+(?:\s*(?:AM|PM))?)/i);
+        const timeMatch = combinedText.match(
+          /(?:(?:at|until|resets?|returns?|after)\s+)?(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)/i,
+        );
         if (timeMatch && timeMatch[1]) {
           resetTime = timeMatch[1].trim();
         }
@@ -519,7 +537,7 @@ export class ClaudeProvider {
     // Pre-flight Rate Limit check
     const preLimit = await this.detectLimit(page);
     if (preLimit.isLimit) {
-      const parsed = this.parseResetAt(preLimit.rawMessage || preLimit.resetTime || "");
+      const parsed = this.parseResetAt(preLimit.resetTime || preLimit.rawMessage || "");
       await ChatStore.setLimit("claude", {
         until: parsed.until,
         approx: parsed.approx,
@@ -791,7 +809,7 @@ export class ClaudeProvider {
       // Check if limit hit while streaming
       const streamLimit = await this.detectLimit(page);
       if (streamLimit.isLimit) {
-        const parsed = this.parseResetAt(streamLimit.rawMessage || streamLimit.resetTime || "");
+        const parsed = this.parseResetAt(streamLimit.resetTime || streamLimit.rawMessage || "");
         await ChatStore.setLimit("claude", {
           until: parsed.until,
           approx: parsed.approx,
