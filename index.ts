@@ -172,8 +172,9 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     }
   }
 
-  // Keep browser alive for multi-turn sessions with 15-minute idle safety timeout
-  // If an active consult loop is open (waiting for evidence or clarification), NEVER close the browser!
+  // Dual-Tier Lifecycle Policy (recommended by Gemini 4 Argon, 9.3/10 rating):
+  // 1. FINAL state: 25-second grace period then cleanly close browser tabs (no more 15-minute ghost windows!).
+  // 2. NEEDS_FOLLOWUP (active loop): Bounded 5-minute watchdog TTL so abandoned loops never leak eternal windows.
   pi.on("agent_end", async (_e, ctx) => {
     try {
       const openLoops = await Promise.all(
@@ -186,14 +187,18 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
       if (active.length > 0) {
         if (ctx?.ui?.notify) {
           ctx.ui.notify(
-            `⚠️ ai-consult: Faol maslahatlashuv davom etmoqda (${active.map((a) => a.p).join(", ")}) — brauzer ochiq qoldirildi.`,
+            `⚠️ ai-consult: Faol maslahatlashuv davom etmoqda (${active.map((a) => a.p).join(", ")}) — brauzer 5 daqiqalik xavfsizlik kutishida.`,
             "warning",
           );
         }
+        // Bounded 5-minute watchdog TTL for open multi-turn loops (never eternal)
+        resetIdleAutoClose(5 * 60 * 1000);
         return;
       }
     } catch {}
-    resetIdleAutoClose(15 * 60 * 1000);
+
+    // When consultation is FINAL or idle, close within 25 seconds
+    resetIdleAutoClose(25 * 1000);
   });
 
   // Clean up on session shutdown
