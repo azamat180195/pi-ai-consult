@@ -803,9 +803,15 @@ Structure:
       ),
       reasoning: Type.Optional(
         Type.Union(
-          [Type.Literal("Высокая"), Type.Literal("Средний"), Type.Literal("Низкая")],
+          [
+            Type.Literal("Высокий"),
+            Type.Literal("Высокая"),
+            Type.Literal("Средний"),
+            Type.Literal("Низкий"),
+            Type.Literal("Низкая"),
+          ],
           {
-            description: "Reasoning level for Gemini 4 Argon: 'Высокая' (Deep), 'Средний', 'Нizкая'. Default: 'Высокая'.",
+            description: "Reasoning level for Gemini 4 Argon: 'Высокий' (Deep), 'Средний', 'Низкий'. Default: 'Высокий'.",
           },
         ),
       ),
@@ -816,7 +822,7 @@ Structure:
         params,
         {
           model: params.model ?? "4 Argon",
-          reasoning: params.reasoning ?? "Высокая",
+          reasoning: params.reasoning ?? "Высокий",
           timeoutSeconds: params.timeoutSeconds,
         },
         ctx,

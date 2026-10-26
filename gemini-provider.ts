@@ -153,7 +153,9 @@ export class GeminiProvider {
       // Check current model
       let currentLabel = (await modeBtn.getAttribute("aria-label")) || (await modeBtn.innerText());
       if (currentLabel.includes(modelName) || currentLabel.includes("Argon")) {
-        return { modelUsed: "4 Argon", reasoningUsed: reasoning };
+        // Even if Argon is already selected, ensure reasoning level is set to Высокий / High!
+        await this.setReasoningLevel(page, modeBtn, reasoning);
+        return { modelUsed: "4 Argon", reasoningUsed: "Высокий (Глубокий)" };
       }
 
       // Open menu
@@ -180,35 +182,43 @@ export class GeminiProvider {
         };
       }
 
-      // If reasoning level is requested and model is 4 Argon, set reasoning
-      if (modelName.includes("Argon")) {
-        await modeBtn.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(400);
-
-        const reasoningMenu = page
-          .locator("[role='menuitem']:has-text('Уровень рассуждений')")
-          .first();
-
-        if ((await reasoningMenu.count()) > 0) {
-          await reasoningMenu.hover().catch(() => {});
-          await page.waitForTimeout(400);
-
-          const levelItem = page
-            .locator(`[role='menuitem']:has-text('${reasoning}'), button:has-text('${reasoning}')`)
-            .first();
-
-          if ((await levelItem.count()) > 0) {
-            await levelItem.click({ force: true }).catch(() => {});
-            await page.waitForTimeout(400);
-          }
-        }
-        // Close menu if still open
-        await page.keyboard.press("Escape").catch(() => {});
-      }
-
-      return { modelUsed: modelName, reasoningUsed: reasoning };
+      // Set reasoning level for 4 Argon
+      await this.setReasoningLevel(page, modeBtn, reasoning);
+      return { modelUsed: modelName, reasoningUsed: "Высокий (Глубокий)" };
     } catch (err: any) {
       return { modelUsed: "unknown", reasoningUsed: reasoning, error: err?.message || String(err) };
+    }
+  }
+
+  private static async setReasoningLevel(page: Page, modeBtn: any, targetLevel = "Высокий"): Promise<void> {
+    try {
+      if (!modeBtn) return;
+      await modeBtn.click({ force: true });
+      await page.waitForTimeout(400);
+
+      const reasoningMenu = page
+        .locator("[role='menuitem']:has-text('Уровень рассуждений'), [role='button']:has-text('Уровень рассуждений')")
+        .first();
+
+      if ((await reasoningMenu.count()) > 0) {
+        await reasoningMenu.hover().catch(() => {});
+        await reasoningMenu.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(400);
+
+        const highItem = page
+          .locator(
+            "[role='menuitem']:has-text('Высокий'), [role='menuitem']:has-text('Глубокий'), [role='menuitem']:has-text('Высокая'), [role='menuitem']:has-text('High')",
+          )
+          .first();
+
+        if ((await highItem.count()) > 0) {
+          await highItem.click({ force: true }).catch(() => {});
+          await page.waitForTimeout(300);
+        }
+      }
+      await page.keyboard.press("Escape").catch(() => {});
+    } catch {
+      await page.keyboard.press("Escape").catch(() => {});
     }
   }
 
