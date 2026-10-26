@@ -22,6 +22,7 @@
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { createJiti } from "jiti";
 import { BrowserManager } from "./browser-manager.js";
 import { ClaudeProvider } from "./claude-provider.js";
 import { ChatGPTProvider } from "./chatgpt-provider.js";
@@ -44,6 +45,33 @@ import {
   type BriefData,
   type OpenIssue,
 } from "./templates.js";
+
+// Dynamic hot-reloader: ensures provider updates on disk take effect immediately without requiring manual /reload
+const jitiLoader = createJiti(__filename, { cache: false });
+
+function loadChatGPTProvider(): typeof ChatGPTProvider {
+  try {
+    return jitiLoader("./chatgpt-provider.ts").ChatGPTProvider || ChatGPTProvider;
+  } catch {
+    return ChatGPTProvider;
+  }
+}
+
+function loadGeminiProvider(): typeof GeminiProvider {
+  try {
+    return jitiLoader("./gemini-provider.ts").GeminiProvider || GeminiProvider;
+  } catch {
+    return GeminiProvider;
+  }
+}
+
+function loadClaudeProvider(): typeof ClaudeProvider {
+  try {
+    return jitiLoader("./claude-provider.ts").ClaudeProvider || ClaudeProvider;
+  } catch {
+    return ClaudeProvider;
+  }
+}
 
 const CONSULT_MULTI_TURN_GUIDELINES = [
   "LANGUAGE ENFORCEMENT - ENGLISH ONLY FOR PROMPTS:",
@@ -601,25 +629,28 @@ Structure:
       try {
         let result: any;
         if (provider === "claude") {
+          const providerClass = loadClaudeProvider();
           const page = await browserManager.getClaudePage(isNew);
-          result = await ClaudeProvider.consult(page, safePrompt, {
+          result = await providerClass.consult(page, safePrompt, {
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
             effort: options.effort ?? "High",
             model: options.model ?? "Sonnet",
           });
         } else if (provider === "chatgpt") {
+          const providerClass = loadChatGPTProvider();
           const page = await browserManager.getChatGPTPage(isNew);
-          result = await ChatGPTProvider.consult(page, safePrompt, {
+          result = await providerClass.consult(page, safePrompt, {
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
             think: options.think ?? true,
           });
         } else {
+          const providerClass = loadGeminiProvider();
           const page = await browserManager.getGeminiPage(isNew);
-          result = await GeminiProvider.consult(page, safePrompt, {
+          result = await providerClass.consult(page, safePrompt, {
             model: options.model ?? "4 Argon",
-            reasoning: (options.reasoning as any) ?? "Высокая",
+            reasoning: (options.reasoning as any) ?? "Высокий",
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
           });

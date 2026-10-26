@@ -427,13 +427,19 @@ export class GeminiProvider {
       await page.waitForTimeout(1000);
 
       const isGenerating = await page.evaluate(() => {
-        const stopBtn = !!document.querySelector(
+        const stopBtn = document.querySelector(
           "button[aria-label*='Остановить'], button[aria-label*='Stop'], button mat-icon[fonticon*='stop' i]",
         );
-        const hasSpinner = !!document.querySelector(
-          "mat-progress-spinner, [class*='thinking'], [class*='progress-spinner']",
+        const isStopVisible = !!stopBtn && (stopBtn as HTMLElement).offsetParent !== null;
+
+        const spinners = Array.from(
+          document.querySelectorAll("mat-progress-spinner, [class*='thinking'], [class*='progress-spinner']"),
         );
-        return stopBtn || hasSpinner;
+        const isSpinnerVisible = spinners.some(
+          (s) => (s as HTMLElement).offsetParent !== null && !s.closest(".loading-content-spinner-container"),
+        );
+
+        return isStopVisible || isSpinnerVisible;
       });
 
       const currentText = await page.evaluate(() => {
@@ -442,7 +448,15 @@ export class GeminiProvider {
         );
         if (msgs.length === 0) return "";
         const last = msgs[msgs.length - 1];
-        let base = ((last as HTMLElement)?.innerText || (last as HTMLElement)?.textContent || "").trim();
+
+        // Clone and strip any <model-thoughts> or reasoning accordions
+        const clone = last.cloneNode(true) as HTMLElement;
+        const thoughts = clone.querySelectorAll("model-thoughts, [class*='thoughts'], mat-expansion-panel");
+        for (const t of thoughts) {
+          t.remove();
+        }
+
+        let base = (clone.innerText || clone.textContent || "").trim();
 
         // Check for dedicated code viewer/panels in Gemini
         const codeView = document.querySelector('code-viewer, div.code-container, [class*="code-block"]');

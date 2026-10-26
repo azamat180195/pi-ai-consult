@@ -659,15 +659,35 @@ export class ChatGPTProvider {
           if (generationError.isReloadNeeded) {
             try {
               await page.reload({ waitUntil: "commit", timeout: 35000 });
-              await page.waitForTimeout(2500);
+
+              // P0 Hydration Barrier: Wait for React hydration on composer before touching DOM
+              const hydStart = Date.now();
+              while (Date.now() - hydStart < 15000) {
+                const hydrated = await page.evaluate(() => {
+                  const ta = document.querySelector("#prompt-textarea, div.ProseMirror, div[contenteditable='true']");
+                  if (!ta) return false;
+                  return Object.keys(ta).some((k) => k.startsWith("__reactFiber") || k.startsWith("__reactProps"));
+                });
+                if (hydrated) break;
+                await page.waitForTimeout(500);
+              }
+
               await this.sweepOverlays(page);
             } catch {}
           } else {
             try {
-              const retryBtn = page.locator('button:has-text("Retry"), button:has-text("Try again")').first();
-              if ((await retryBtn.count()) > 0 && (await retryBtn.isVisible())) {
-                await retryBtn.click({ force: true });
-                await page.waitForTimeout(2000);
+              // P1 Pre-Retry Invariant: Ensure Stop button is not active to prevent parallel streams
+              const isStillStreaming = await page.evaluate(() => {
+                const stop = document.querySelector('button[aria-label*="Stop" i], button[data-testid*="stop" i]');
+                return !!stop && (stop as HTMLElement).offsetParent !== null;
+              });
+
+              if (!isStillStreaming) {
+                const retryBtn = page.locator('button:has-text("Retry"), button:has-text("Try again")').first();
+                if ((await retryBtn.count()) > 0 && (await retryBtn.isVisible())) {
+                  await retryBtn.click({ force: true });
+                  await page.waitForTimeout(2000);
+                }
               }
             } catch {}
           }

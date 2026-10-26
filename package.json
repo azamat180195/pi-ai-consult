@@ -22,6 +22,7 @@
     ]
   },
   "dependencies": {
+    "jiti": "^2.7.0",
     "playwright-core": "^1.50.0"
   },
   "peerDependencies": {
