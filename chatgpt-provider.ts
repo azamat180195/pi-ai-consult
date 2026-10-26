@@ -230,11 +230,11 @@ export class ChatGPTProvider {
       await ChatStore.clearLastChat("chatgpt");
     } else {
       const currentUrl = page.url();
-      if (currentUrl.includes("chatgpt.com/c/")) {
+      if (currentUrl.includes("chatgpt.com/c/") && !currentUrl.includes("local-chatgpt")) {
         targetUrl = currentUrl;
       } else {
         const last = await ChatStore.getLastChat("chatgpt");
-        if (last && last.chatUrl && last.chatUrl.includes("chatgpt.com/c/")) {
+        if (last && last.chatUrl && last.chatUrl.includes("chatgpt.com/c/") && !last.chatUrl.includes("local-chatgpt")) {
           targetUrl = last.chatUrl;
         }
       }
@@ -254,14 +254,14 @@ export class ChatGPTProvider {
     await this.sweepOverlays(page);
 
     // 1.05 Reconnaissance: If not newChat, check top recent chat in sidebar to avoid duplicate prompts
-    if (!options.newChat && !page.url().includes("chatgpt.com/c/")) {
+    if (!options.newChat && (!page.url().includes("chatgpt.com/c/") || page.url().includes("local-chatgpt"))) {
       try {
         const topRecentUrl = await page.evaluate(() => {
           const links = Array.from(document.querySelectorAll('a[href*="/c/"]'));
           for (const a of links) {
             if (a.closest('[data-testid*="pinned" i], [class*="pinned" i]')) continue;
             const href = (a as HTMLAnchorElement).href;
-            if (/^https:\/\/chatgpt\.com\/(?:g\/[\w-]+\/)?c\/[0-9a-f-]{36}$/i.test(href)) {
+            if (/^https:\/\/chatgpt\.com\/(?:g\/[\w-]+\/)?c\/[0-9a-f-]{36}$/i.test(href) && !href.includes("local-chatgpt")) {
               return href;
             }
           }
@@ -475,7 +475,7 @@ export class ChatGPTProvider {
     // Immediate Write-Ahead URL Capture: As soon as URL transitions to /c/<id>, save immediately!
     for (let i = 0; i < 20; i++) {
       const u = page.url();
-      if (u.includes("chatgpt.com/c/")) {
+      if (u.includes("chatgpt.com/c/") && !u.includes("local-chatgpt")) {
         await ChatStore.saveLastChat("chatgpt", { chatUrl: u, lastPrompt: prompt, nonce });
         break;
       }
@@ -504,6 +504,7 @@ export class ChatGPTProvider {
     let lastLen = 0;
     let lastResponse = "";
     let stableChecks = 0;
+    let retryAttempts = 0;
 
     while (Date.now() < deadline) {
       await page.waitForTimeout(1500);
@@ -594,6 +595,91 @@ export class ChatGPTProvider {
           resetTime: streamLimit.resetTime,
           error: `🛑 [Limit tugadi]: Xabar yozilayotgan paytda ChatGPT limiti tugab qoldi! (${streamLimit.resetTime || "birozdan so'ng"}).`,
         };
+      }
+
+      // Check for inline error notices ("Unknown error", "Something went wrong", "reloading the conversation")
+      const generationError = await page.evaluate(() => {
+        const errorNodes = Array.from(
+          document.querySelectorAll(
+            '[data-testid*="error"], .text-red-500, .text-danger, div[class*="border-red"], div[class*="bg-red"], [role="alert"]',
+          ),
+        );
+
+        for (const el of errorNodes) {
+          const text = (el as HTMLElement).innerText?.trim() || "";
+          if (
+            text.includes("Unknown error") ||
+            text.includes("Something went wrong") ||
+            text.includes("error generating a response") ||
+            text.includes("reloading the conversation") ||
+            text.includes("An error occurred") ||
+            text.includes("network error")
+          ) {
+            return {
+              hasError: true,
+              message: text,
+              isReloadNeeded: text.toLowerCase().includes("reload"),
+            };
+          }
+        }
+
+        // Check for standalone Retry/Try again button in error cards
+        const retryBtn = document.querySelector('button:has-text("Retry"), button:has-text("Try again")');
+        if (retryBtn) {
+          const container = (retryBtn as HTMLElement).closest('div[class*="border"], div[class*="error"]') || retryBtn.parentElement;
+          return {
+            hasError: true,
+            message: (container as HTMLElement)?.innerText?.trim() || "Unknown error",
+            isReloadNeeded: false,
+          };
+        }
+
+        // Check for centered reload prompt text
+        const reloadText = Array.from(document.querySelectorAll("div, p, span")).find((el) => {
+          const t = el.textContent || "";
+          return (
+            t.includes("Please try reloading the conversation") ||
+            t.includes("error generating a response")
+          );
+        });
+        if (reloadText) {
+          return {
+            hasError: true,
+            message: reloadText.textContent?.trim() || "Please try reloading the conversation",
+            isReloadNeeded: true,
+          };
+        }
+
+        return { hasError: false, message: "", isReloadNeeded: false };
+      });
+
+      if (generationError.hasError && !status.currentTurnText) {
+        if (retryAttempts < 2) {
+          retryAttempts++;
+          if (generationError.isReloadNeeded) {
+            try {
+              await page.reload({ waitUntil: "commit", timeout: 35000 });
+              await page.waitForTimeout(2500);
+              await this.sweepOverlays(page);
+            } catch {}
+          } else {
+            try {
+              const retryBtn = page.locator('button:has-text("Retry"), button:has-text("Try again")').first();
+              if ((await retryBtn.count()) > 0 && (await retryBtn.isVisible())) {
+                await retryBtn.click({ force: true });
+                await page.waitForTimeout(2000);
+              }
+            } catch {}
+          }
+          stableChecks = 0;
+          continue;
+        } else {
+          return {
+            success: false,
+            text: "",
+            error: `🛑 [ChatGPT xatosi]: ${generationError.message || "Unknown error"}. ChatGPT serverlarida uzilish yoki yuklama yuqoriligi sababli javob bermadi.`,
+          };
+        }
       }
 
       // Adaptive streaming budget: as long as new text is arriving, extend deadline up to 15m max
