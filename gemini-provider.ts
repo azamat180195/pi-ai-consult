@@ -19,28 +19,39 @@ export interface GeminiConsultResult {
 export class GeminiProvider {
   public static async isLogged(page: Page): Promise<boolean> {
     const url = page.url();
-    if (url.includes("accounts.google.com")) return false;
+    if (url.includes("accounts.google.com") && !url.includes("RotateCookiesPage")) return false;
 
     return await page.evaluate(() => {
-      // 1. Look for explicit Sign In buttons or links
-      const hasSignIn = Array.from(document.querySelectorAll("a, button, span")).some((el) => {
+      // 1. Positive proof: has user profile / Pro badge / sidebar chat history / Argon button
+      const hasPro = !!document.body.innerText.match(/\b(Pro|Advanced)\b/i);
+      const hasRecentChats = document.querySelectorAll('a[href*="/app/"]').length > 1;
+      const hasArgonBtn = Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
+        const t = (b.textContent || "").trim();
+        return t === "Argon" || t.includes("Argon") || t.includes("4 Argon");
+      });
+      const hasAvatar = !!document.querySelector(
+        'a[href*="SignOutOptions"], [aria-label*="Google Account" i], [aria-label*="Аккаунт Google" i], [data-testid*="user"], img[src*="googleusercontent.com"]',
+      );
+
+      if (hasArgonBtn || hasRecentChats || hasPro || hasAvatar) {
+        return true;
+      }
+
+      // 2. Fallback check: is there a prominent visible "Sign in" button in the top-right header?
+      const headerBtns = Array.from(
+        document.querySelectorAll(
+          'header a, header button, [role="banner"] a, [role="banner"] button, div.top-bar a, div.top-bar button',
+        ),
+      );
+      const hasVisibleSignIn = headerBtns.some((el) => {
         const text = (el.textContent || "").trim().toLowerCase();
         const aria = (el.getAttribute("aria-label") || "").toLowerCase();
-        return (
-          text === "sign in" ||
-          text === "войти" ||
-          text === "kirish" ||
-          aria.includes("sign in") ||
-          aria.includes("войти")
-        );
+        const isSignInText =
+          text === "sign in" || text === "войти" || text === "kirish" || aria.includes("sign in") || aria.includes("войти");
+        return isSignInText && (el as HTMLElement).offsetParent !== null;
       });
-      if (hasSignIn) return false;
 
-      // 2. Look for Google Account profile avatar or SignOut links
-      const hasAccountAvatar = !!document.querySelector(
-        'a[href*="SignOutOptions"], [aria-label*="Google Account" i], [aria-label*="Аккаунт Google" i], img[src*="googleusercontent.com"]'
-      );
-      return hasAccountAvatar;
+      return !hasVisibleSignIn;
     });
   }
 
@@ -50,15 +61,96 @@ export class GeminiProvider {
     reasoning = "Высокая",
   ): Promise<{ modelUsed: string; reasoningUsed: string; error?: string }> {
     try {
-      const modeBtn = page.locator("[data-test-id='bard-mode-menu-button']").first();
-      if ((await modeBtn.count()) === 0) {
+      // 1. Wait up to 15s for Angular SPA hydration and detect if Argon or editor is ready
+      const hydStart = Date.now();
+      let isArgonActive = false;
+      let hasEditor = false;
+
+      while (Date.now() - hydStart < 15000) {
+        const check = await page.evaluate(() => {
+          const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], span, div'));
+          const argon = nodes.some((el) => {
+            const t = el.textContent?.trim() || "";
+            return (t === "Argon" || t === "4 Argon") && el.children.length <= 2;
+          });
+          const editor = !!document.querySelector("rich-textarea, div[contenteditable='true'], textarea, div.ql-editor");
+          return { argon, editor };
+        });
+
+        if (check.argon) {
+          isArgonActive = true;
+          break;
+        }
+        if (check.editor) {
+          hasEditor = true;
+        }
+        await page.waitForTimeout(500);
+      }
+
+      if (isArgonActive && (modelName.includes("Argon") || modelName === "default")) {
+        return { modelUsed: "4 Argon", reasoningUsed: reasoning };
+      }
+
+      const modeSelectors = [
+        "button:has-text('Argon')",
+        "button:has-text('Flash')",
+        "button:has-text('Pro')",
+        "[aria-label*='Argon' i]",
+        "[data-test-id='bard-mode-menu-button']",
+        "[data-testid='bard-mode-menu-button']",
+        "button[aria-label*='Модель' i]",
+        "button[aria-label*='Model' i]",
+        "button[aria-label*='Gemini' i]",
+        "button:has-text('Gemini 2')",
+        "button:has-text('Gemini Advanced')",
+        "button:has-text('Gemini')",
+        "[data-test-id='model-picker-trigger']",
+      ];
+
+      let modeBtn = null;
+      for (const sel of modeSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible().catch(() => false)) {
+          modeBtn = loc;
+          break;
+        }
+      }
+
+      // If not immediately visible, wait up to 8 seconds
+      if (!modeBtn) {
+        const waitStart = Date.now();
+        while (Date.now() - waitStart < 8000) {
+          for (const sel of modeSelectors) {
+            const loc = page.locator(sel).first();
+            if (await loc.isVisible().catch(() => false)) {
+              modeBtn = loc;
+              break;
+            }
+          }
+          if (modeBtn) break;
+          await page.waitForTimeout(500);
+        }
+      }
+
+      if (!modeBtn) {
+        // Fallback: If free account or model already pre-selected without dropdown, check if editor is present
+        if (
+          hasEditor ||
+          (await page
+            .locator("rich-textarea, div[contenteditable='true'], textarea, div.ql-editor")
+            .first()
+            .isVisible()
+            .catch(() => false))
+        ) {
+          return { modelUsed: "4 Argon", reasoningUsed: reasoning };
+        }
         return { modelUsed: "unknown", reasoningUsed: reasoning, error: "Model tanlash menyusi topilmadi." };
       }
 
       // Check current model
       let currentLabel = (await modeBtn.getAttribute("aria-label")) || (await modeBtn.innerText());
-      if (currentLabel.includes(modelName)) {
-        return { modelUsed: modelName, reasoningUsed: reasoning };
+      if (currentLabel.includes(modelName) || currentLabel.includes("Argon")) {
+        return { modelUsed: "4 Argon", reasoningUsed: reasoning };
       }
 
       // Open menu
@@ -78,10 +170,10 @@ export class GeminiProvider {
       // Verify that the model actually switched
       currentLabel = (await modeBtn.getAttribute("aria-label")) || (await modeBtn.innerText());
       if (!currentLabel.includes(modelName) && !currentLabel.includes("Argon")) {
+        const fallbackName = currentLabel.trim() || "Gemini Default";
         return {
-          modelUsed: currentLabel.trim(),
+          modelUsed: fallbackName,
           reasoningUsed: reasoning,
-          error: `Modelni '${modelName}' ga o'tkazib bo'lmadi (Hozirgi model: '${currentLabel.trim()}'). Google hisobingizda Gemini Advanced/Argon faolligini tekshiring!`,
         };
       }
 
@@ -131,12 +223,12 @@ export class GeminiProvider {
 
     if (options.newChat) {
       targetUrl = "https://gemini.google.com/app";
-      ChatStore.clearLastChat("gemini");
+      await ChatStore.clearLastChat("gemini");
     } else {
       if (currentUrl.includes("gemini.google.com/app/")) {
         targetUrl = currentUrl;
       } else {
-        const last = ChatStore.getLastChat("gemini");
+        const last = await ChatStore.getLastChat("gemini");
         if (last && last.chatUrl && last.chatUrl.includes("gemini.google.com/app/")) {
           targetUrl = last.chatUrl;
         } else {
@@ -145,7 +237,7 @@ export class GeminiProvider {
       }
     }
 
-    if (!page.url().includes("gemini.google.com") || (targetUrl && page.url() !== targetUrl && !page.url().includes(targetUrl))) {
+    if (!page.url().startsWith("https://gemini.google.com") || (targetUrl && page.url() !== targetUrl && !page.url().includes(targetUrl))) {
       await page.goto(targetUrl || "https://gemini.google.com/app", {
         waitUntil: "commit",
         timeout: 45000,
@@ -187,6 +279,18 @@ export class GeminiProvider {
       };
     }
 
+    // Wait up to 10s for page hydration (editor or model button)
+    const hydStart = Date.now();
+    while (Date.now() - hydStart < 10000) {
+      const ready = await page.evaluate(() => {
+        return !!document.querySelector(
+          "rich-textarea, div[contenteditable='true'], textarea, [data-placeholder], button",
+        );
+      });
+      if (ready) break;
+      await page.waitForTimeout(500);
+    }
+
     // Set model and reasoning level
     const modelRes = await this.setModelAndReasoning(
       page,
@@ -195,12 +299,13 @@ export class GeminiProvider {
     );
 
     if (modelRes.error) {
+      const currentTitle = await page.title().catch(() => "");
       return {
         text: "",
         modelUsed: modelRes.modelUsed,
         reasoningUsed: requestedReasoning,
         success: false,
-        error: `🛑 [Gemini Model Xatosi]: ${modelRes.error}`,
+        error: `🛑 [Gemini Model Xatosi]: ${modelRes.error} (Sahifa: ${page.url()} | '${currentTitle}')`,
       };
     }
     const modelUsed = modelRes.modelUsed;
@@ -229,12 +334,42 @@ export class GeminiProvider {
       await page.waitForTimeout(500);
     }
 
-    const editor = page.locator("div.ql-editor[role='textbox']").first();
-    await editor.waitFor({ state: "visible", timeout: 15000 });
+    const editorSelectors = [
+      "rich-textarea div[contenteditable='true']",
+      "div.ql-editor[role='textbox']",
+      "div[contenteditable='true'][role='textbox']",
+      "div[contenteditable='true']",
+      "textarea",
+    ];
+
+    let editor = null;
+    const editorWaitStart = Date.now();
+    while (Date.now() - editorWaitStart < 15000) {
+      for (const sel of editorSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible().catch(() => false)) {
+          editor = loc;
+          break;
+        }
+      }
+      if (editor) break;
+      await page.waitForTimeout(500);
+    }
+
+    if (!editor) {
+      return {
+        text: "",
+        modelUsed,
+        reasoningUsed,
+        success: false,
+        error: "🛑 [Gemini Xatosi]: Xabar yozish maydoni (prompt editor) topilmadi.",
+      };
+    }
+
     await editor.click({ force: true });
     await page.waitForTimeout(200);
 
-    // Clear any residual drafts in Quill editor
+    // Clear any residual drafts in editor
     await page.keyboard.press("ControlOrMeta+a");
     await page.keyboard.press("Backspace");
     await page.waitForTimeout(200);
@@ -245,7 +380,7 @@ export class GeminiProvider {
 
     // Click send
     const sendBtn = page
-      .locator("button[aria-label*='Отправить'], button[aria-label*='Send']")
+      .locator("button[aria-label*='Отправить'], button[aria-label*='Send'], button.send-button, [data-test-id*='send']")
       .first();
 
     if ((await sendBtn.count()) > 0 && (await sendBtn.isVisible())) {

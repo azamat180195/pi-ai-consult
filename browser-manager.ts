@@ -504,8 +504,12 @@ export class BrowserManager {
       return this.geminiPage;
     }
 
+    // In CDP mode, search existing tabs first
     if (this.mode === "cdp") {
-      const existing = ctx.pages().find((p) => p.url().includes("gemini.google.com"));
+      const existing = ctx.pages().find((p) => {
+        const u = p.url();
+        return (u.startsWith("https://gemini.google.com") || u.startsWith("https://www.gemini.google.com")) && !u.includes("accounts.google.com");
+      });
       if (existing && !existing.isClosed() && !forceNew) {
         this.geminiPage = existing;
         await this.geminiPage.bringToFront();
