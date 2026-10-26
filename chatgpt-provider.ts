@@ -606,6 +606,11 @@ export class ChatGPTProvider {
         );
 
         for (const el of errorNodes) {
+          // Strictly exclude message content so prompts discussing errors never trigger false positive retries
+          if (el.closest('[data-message-author-role]') || el.closest('.markdown') || el.closest('#prompt-textarea')) {
+            continue;
+          }
+
           const text = (el as HTMLElement).innerText?.trim() || "";
           if (
             text.includes("Unknown error") ||
@@ -625,8 +630,10 @@ export class ChatGPTProvider {
 
         // Check for standalone Retry/Try again button in error cards
         const retryBtn = Array.from(document.querySelectorAll("button")).find((b) => {
+          if ((b as HTMLElement).offsetParent === null) return false;
+          if (b.closest('[data-message-author-role="user"]') || b.closest('#prompt-textarea')) return false;
           const t = (b.innerText || b.textContent || "").trim();
-          return t === "Retry" || t === "Try again" || t.includes("Retry") || t.includes("Try again");
+          return t === "Retry" || t === "Try again" || t === "Повторить" || t.includes("Retry");
         });
         if (retryBtn) {
           const container = (retryBtn as HTMLElement).closest('div[class*="border"], div[class*="error"]') || retryBtn.parentElement;
@@ -639,6 +646,9 @@ export class ChatGPTProvider {
 
         // Check for centered reload prompt text
         const reloadText = Array.from(document.querySelectorAll("div, p, span")).find((el) => {
+          if (el.closest('[data-message-author-role]') || el.closest('.markdown') || el.closest('#prompt-textarea')) {
+            return false;
+          }
           const t = el.textContent || "";
           return (
             t.includes("Please try reloading the conversation") ||

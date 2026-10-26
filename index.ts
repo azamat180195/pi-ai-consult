@@ -47,7 +47,8 @@ import {
 } from "./templates.js";
 
 // Dynamic hot-reloader: ensures provider updates on disk take effect immediately without requiring manual /reload
-const jitiLoader = createJiti(__filename, { cache: false });
+// In Jiti v2, moduleCache: false and fsCache: false are required (cache: false was ignored in v2)
+const jitiLoader = createJiti(__filename, { moduleCache: false, fsCache: false });
 
 function loadChatGPTProvider(): typeof ChatGPTProvider {
   try {
