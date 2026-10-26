@@ -22,8 +22,11 @@ export class GeminiProvider {
     if (url.includes("accounts.google.com") && !url.includes("RotateCookiesPage")) return false;
 
     return await page.evaluate(() => {
+      if (!document.body) return false;
+      const bodyText = document.body.innerText || document.body.textContent || "";
+
       // 1. Positive proof: has user profile / Pro badge / sidebar chat history / Argon button
-      const hasPro = !!document.body.innerText.match(/\b(Pro|Advanced)\b/i);
+      const hasPro = !!bodyText.match(/\b(Pro|Advanced)\b/i);
       const hasRecentChats = document.querySelectorAll('a[href*="/app/"]').length > 1;
       const hasArgonBtn = Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
         const t = (b.textContent || "").trim();
@@ -429,16 +432,17 @@ export class GeminiProvider {
         );
         if (msgs.length === 0) return "";
         const last = msgs[msgs.length - 1];
-        let base = (last as HTMLElement).innerText.trim();
+        let base = ((last as HTMLElement)?.innerText || (last as HTMLElement)?.textContent || "").trim();
 
         // Check for dedicated code viewer/panels in Gemini
         const codeView = document.querySelector('code-viewer, div.code-container, [class*="code-block"]');
+        const codeText = ((codeView as HTMLElement)?.innerText || (codeView as HTMLElement)?.textContent || "").trim();
         if (
           codeView &&
-          (codeView as HTMLElement).innerText.length > 50 &&
-          !base.includes((codeView as HTMLElement).innerText.slice(0, 50))
+          codeText.length > 50 &&
+          !base.includes(codeText.slice(0, 50))
         ) {
-          base += `\n\n---\n### 📦 Gemini Code File:\n\`\`\`\n${(codeView as HTMLElement).innerText.trim()}\n\`\`\``;
+          base += `\n\n---\n### 📦 Gemini Code File:\n\`\`\`\n${codeText}\n\`\`\``;
         }
 
         return base;
