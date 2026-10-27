@@ -82,30 +82,57 @@ const sha = (s: string, n = 12) =>
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function findProjectRoot(start: string): string | null {
-  let p = start;
-  for (let i = 0; i < 15; i++) {
-    if (
-      fs.existsSync(path.join(p, ".git")) ||
-      fs.existsSync(path.join(p, ".pi")) ||
-      fs.existsSync(path.join(p, ".ai-consult.json")) ||
-      fs.existsSync(path.join(p, "package.json")) ||
-      fs.existsSync(path.join(p, "Cargo.toml")) ||
-      fs.existsSync(path.join(p, "pyproject.toml"))
-    ) {
-      return p;
+function findProjectRoot(start: string): string {
+  try {
+    const startPath = path.resolve(start);
+    const homePath = path.resolve(os.homedir());
+    const filesystemRoot = path.parse(startPath).root;
+
+    const norm = (s: string) => (process.platform === "win32" ? s.toLowerCase() : s);
+    const isHome = (s: string) => norm(s) === norm(homePath);
+    const isFsRoot = (s: string) => norm(s) === norm(filesystemRoot);
+
+    if (isHome(startPath)) return startPath;
+
+    let candidate = startPath;
+    for (let i = 0; i < 20; i++) {
+      // NEVER match os.homedir() as project root!
+      // ~/.pi or ~/.git at home level is global settings/dotfiles, NOT a project root.
+      if (isHome(candidate) || isFsRoot(candidate)) {
+        break;
+      }
+
+      const hasMarker =
+        fs.existsSync(path.join(candidate, ".git")) ||
+        fs.existsSync(path.join(candidate, ".pi")) ||
+        fs.existsSync(path.join(candidate, ".ai-consult.json")) ||
+        fs.existsSync(path.join(candidate, "package.json")) ||
+        fs.existsSync(path.join(candidate, "Cargo.toml")) ||
+        fs.existsSync(path.join(candidate, "pyproject.toml")) ||
+        fs.existsSync(path.join(candidate, "go.mod"));
+
+      if (hasMarker) {
+        return candidate;
+      }
+
+      const parent = path.dirname(candidate);
+      if (norm(parent) === norm(candidate)) break;
+      candidate = parent;
     }
-    const up = path.dirname(p);
-    if (up === p) break;
-    p = up;
+
+    // Default: If no marker is found below home, return the start workspace itself!
+    // A scratch directory without .git (e.g. ~/Desktop/mute-with-location)
+    // is its own isolated project, NOT Administrator!
+    return startPath;
+  } catch {
+    return start;
   }
-  return null;
 }
 
 export function getProjectLabel(cwd = process.cwd()): string {
   if (process.env.AI_CONSULT_SCOPE) return process.env.AI_CONSULT_SCOPE;
   try {
-    const root = findProjectRoot(cwd) ?? cwd;
+    const root = findProjectRoot(cwd);
     const base = path.basename(root);
     return base || "default";
   } catch {
@@ -116,8 +143,8 @@ export function getProjectLabel(cwd = process.cwd()): string {
 export function getScopeKey(cwd = process.cwd()): string {
   if (process.env.AI_CONSULT_SCOPE) return sha(process.env.AI_CONSULT_SCOPE);
   try {
-    let p = fs.realpathSync.native ? fs.realpathSync.native(cwd) : fs.realpathSync(cwd);
-    p = findProjectRoot(p) ?? p;
+    const root = findProjectRoot(cwd);
+    let p = fs.realpathSync.native ? fs.realpathSync.native(root) : fs.realpathSync(root);
     if (process.platform === "win32") p = p.toLowerCase().replace(/\\/g, "/");
     return sha(p, 10);
   } catch {

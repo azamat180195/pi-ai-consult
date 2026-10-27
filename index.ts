@@ -523,18 +523,12 @@ Structure:
       }),
     ),
     newChatReason: Type.Optional(
-      Type.Union(
-        [
-          Type.Literal("no_active_record"),
-          Type.Literal("user_directive"),
-          Type.Literal("new_workstream"),
-          Type.Literal("saturated"),
-          Type.Literal("thread_broken"),
-        ],
-        {
-          description: "Reason for starting a new chat thread when newChat is true",
-        },
-      ),
+      Type.String({
+        minLength: 1,
+        maxLength: 128,
+        description:
+          "Reason for starting a new chat thread (e.g. 'new_project', 'initial_consultation', 'topic_change', 'user_directive', 'saturated').",
+      }),
     ),
     evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
     abandonLoop: Type.Optional(
@@ -573,39 +567,33 @@ Structure:
     const hasHealthyChat = !!lastChat?.chatUrl && (lastChat.turns ?? 0) < 35;
 
     let isNew = false;
-    let overridden = false;
+    let reasonLabel = typeof params.newChatReason === "string" ? params.newChatReason.trim() : "";
+
     if (params.newChat === true) {
-      if (params.newChatReason || !hasHealthyChat) {
-        isNew = true;
-      } else {
-        // If agent requested newChat without reason, but healthy active chat exists, auto-continue!
-        isNew = false;
-        overridden = true;
-      }
+      // INVARIANT: Explicit newChat=true is absolute and NEVER overridden
+      isNew = true;
+      if (!reasonLabel) reasonLabel = "explicit_new_chat";
     } else if (params.newChat === false) {
-      isNew = false;
-    } else {
-      // Omitted: default to continue if healthy chat exists, otherwise new
+      // INVARIANT: Explicit newChat=false resumes the scoped record (or opens new if no record exists)
       isNew = !hasHealthyChat;
+      if (isNew && !reasonLabel) reasonLabel = "no_active_record";
+    } else {
+      // Default: continue healthy scoped chat, or start new if none exists
+      isNew = !hasHealthyChat;
+      if (isNew && !reasonLabel) reasonLabel = "initial_topic";
     }
 
     const projectLabel = ChatStore.getProjectLabel();
     const shortChat = lastChat?.chatUrl ? lastChat.chatUrl.split("/").pop() : "";
 
-    if (overridden && ctx?.ui?.notify) {
-      ctx.ui.notify(
-        `⚠ [ai-consult]: newChat so'rovi rad etildi (faol chat mavjud) — ${provider.toUpperCase()} suhbati davom ettirilmoqda (${projectLabel})`,
-        "info",
-      );
-    } else if (!isNew && ctx?.ui?.notify) {
+    if (!isNew && ctx?.ui?.notify) {
       ctx.ui.notify(
         `↻ [ai-consult]: ${provider.toUpperCase()} chat DAVOM ettirildi · loyiha: ${projectLabel} · ${shortChat} · ${(lastChat?.turns ?? 0) + 1}-navbat`,
         "info",
       );
     } else if (isNew && ctx?.ui?.notify) {
-      const reasonLabel = params.newChatReason ?? "yangi loyiha";
       ctx.ui.notify(
-        `✚ [ai-consult]: YANGI ${provider.toUpperCase()} chat ochilmoqda · loyiha: ${projectLabel} · sabab: ${reasonLabel}`,
+        `✚ [ai-consult]: YANGI ${provider.toUpperCase()} chat ochilmoqda · loyiha: ${projectLabel} · sabab: ${reasonLabel || "yangi loyiha"}`,
         "info",
       );
     }
