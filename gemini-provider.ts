@@ -90,9 +90,8 @@ export class GeminiProvider {
         await page.waitForTimeout(500);
       }
 
-      if (isArgonActive && (modelName.includes("Argon") || modelName === "default")) {
-        return { modelUsed: "4 Argon", reasoningUsed: reasoning };
-      }
+      // Removed premature early return when isArgonActive was true:
+      // previously it returned immediately on line 94 without configuring the reasoning level!
 
       const modeSelectors = [
         "button:has-text('Argon')",
@@ -153,9 +152,9 @@ export class GeminiProvider {
       // Check current model
       let currentLabel = (await modeBtn.getAttribute("aria-label")) || (await modeBtn.innerText());
       if (currentLabel.includes(modelName) || currentLabel.includes("Argon")) {
-        // Even if Argon is already selected, ensure reasoning level is set to Высокий / High!
-        await this.setReasoningLevel(page, modeBtn, reasoning);
-        return { modelUsed: "4 Argon", reasoningUsed: "Высокий (Глубокий)" };
+        // Even if Argon is already selected, ALWAYS configure and verify reasoning level!
+        const resReasoning = await this.setReasoningLevel(page, modeBtn, reasoning);
+        return { modelUsed: "4 Argon", reasoningUsed: resReasoning };
       }
 
       // Open menu
@@ -183,42 +182,103 @@ export class GeminiProvider {
       }
 
       // Set reasoning level for 4 Argon
-      await this.setReasoningLevel(page, modeBtn, reasoning);
-      return { modelUsed: modelName, reasoningUsed: "Высокий (Глубокий)" };
+      const verifiedReasoning = await this.setReasoningLevel(page, modeBtn, reasoning);
+      return { modelUsed: modelName, reasoningUsed: verifiedReasoning };
     } catch (err: any) {
       return { modelUsed: "unknown", reasoningUsed: reasoning, error: err?.message || String(err) };
     }
   }
 
-  private static async setReasoningLevel(page: Page, modeBtn: any, targetLevel = "Высокий"): Promise<void> {
+  private static async setReasoningLevel(page: Page, modeBtn: any, targetLevel = "Высокий"): Promise<string> {
     try {
-      if (!modeBtn) return;
+      if (!modeBtn) return "Default";
+
+      // 1. Open the model/mode menu
       await modeBtn.click({ force: true });
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(500);
 
-      const reasoningMenu = page
-        .locator("[role='menuitem']:has-text('Уровень рассуждений'), [role='button']:has-text('Уровень рассуждений')")
-        .first();
+      // 2. Find the reasoning effort section across English and Russian
+      const sectionSelectors = [
+        "[role='menuitem']:has-text('Уровень рассуждений')",
+        "[role='menuitem']:has-text('Reasoning effort')",
+        "[role='menuitem']:has-text('Reasoning level')",
+        "[role='menuitem']:has-text('Thinking')",
+        "[role='button']:has-text('Уровень рассуждений')",
+        "[role='button']:has-text('Reasoning effort')",
+        "button:has-text('Уровень рассуждений')",
+      ];
 
-      if ((await reasoningMenu.count()) > 0) {
-        await reasoningMenu.hover().catch(() => {});
-        await reasoningMenu.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(400);
-
-        const highItem = page
-          .locator(
-            "[role='menuitem']:has-text('Высокий'), [role='menuitem']:has-text('Глубокий'), [role='menuitem']:has-text('Высокая'), [role='menuitem']:has-text('High')",
-          )
-          .first();
-
-        if ((await highItem.count()) > 0) {
-          await highItem.click({ force: true }).catch(() => {});
-          await page.waitForTimeout(300);
+      let reasoningSection = null;
+      for (const sel of sectionSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible().catch(() => false)) {
+          reasoningSection = loc;
+          break;
         }
       }
+
+      if (!reasoningSection) {
+        await page.keyboard.press("Escape").catch(() => {});
+        return "Default";
+      }
+
+      // 3. Hover and click to expand the reasoning options
+      await reasoningSection.hover().catch(() => {});
+      await reasoningSection.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(400);
+
+      // 4. Locate High / Deep options across English and Russian
+      const highSelectors = [
+        "[role='menuitemradio']:has-text('Высокий')",
+        "[role='menuitemradio']:has-text('High')",
+        "[role='menuitemradio']:has-text('Глубокий')",
+        "[role='menuitem']:has-text('Высокий')",
+        "[role='menuitem']:has-text('Глубокий')",
+        "[role='menuitem']:has-text('Высокая')",
+        "[role='menuitem']:has-text('High')",
+        "[role='menuitem']:has-text('Deep')",
+        "mat-radio-button:has-text('Высокий')",
+        "mat-radio-button:has-text('High')",
+        "[role='option']:has-text('Высокий')",
+        "[role='option']:has-text('High')",
+      ];
+
+      let targetItem = null;
+      for (const sel of highSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible().catch(() => false)) {
+          targetItem = loc;
+          break;
+        }
+      }
+
+      if (targetItem) {
+        // Read if already selected
+        const isAlreadyChecked = await targetItem.evaluate((el: Element) => {
+          return (
+            el.getAttribute("aria-checked") === "true" ||
+            el.getAttribute("aria-selected") === "true" ||
+            el.classList.contains("mat-mdc-radio-checked") ||
+            el.classList.contains("mat-radio-checked") ||
+            !!el.querySelector("mat-icon:has-text('check'), [class*='check'], [data-state='checked']")
+          );
+        }).catch(() => false);
+
+        if (!isAlreadyChecked) {
+          await targetItem.click({ force: true }).catch(() => {});
+          await page.waitForTimeout(350);
+        }
+
+        // Close menu cleanly
+        await page.keyboard.press("Escape").catch(() => {});
+        return "Высокий (Глубокий)";
+      }
+
       await page.keyboard.press("Escape").catch(() => {});
+      return "Default";
     } catch {
       await page.keyboard.press("Escape").catch(() => {});
+      return "Default";
     }
   }
 
