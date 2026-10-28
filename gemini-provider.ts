@@ -529,6 +529,23 @@ export class GeminiProvider {
           base += `\n\n---\n### 📦 Gemini Code File:\n\`\`\`\n${codeText}\n\`\`\``;
         }
 
+        // Check for generated images in Gemini (Imagen / Visual cards)
+        try {
+          const genImgs = Array.from(last.querySelectorAll("img"));
+          const imgItems: string[] = [];
+          for (const img of genImgs) {
+            if (img.closest("nav, [class*='avatar' i]")) continue;
+            const src = img.currentSrc || img.src;
+            const alt = img.getAttribute("alt") || "Gemini Generated Visual";
+            if (src && (img.width > 50 || img.height > 50 || !img.width)) {
+              imgItems.push(`- 🖼️ ![${alt}](${src})`);
+            }
+          }
+          if (imgItems.length > 0) {
+            base += `\n\n---\n### 🎨 Gemini Visual Artifacts:\n${imgItems.join("\n")}`;
+          }
+        } catch {}
+
         return base;
       });
 

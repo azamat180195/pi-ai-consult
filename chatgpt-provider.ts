@@ -559,11 +559,54 @@ export class ChatGPTProvider {
 
           let currentTurnText = "";
           let hasCopyBtn = false;
+          let visualArtifactsText = "";
 
           if (assistantAfterUser) {
             const md = assistantAfterUser.querySelector('.markdown, [class*="MarkdownRoot"], [class*="response-"]');
             currentTurnText = ((md as HTMLElement)?.innerText || assistantAfterUser.innerText || "").trim();
             hasCopyBtn = !!assistantAfterUser.querySelector('button[aria-label*="Copy" i], button[data-testid*="copy"]');
+
+            // Harvest multimodal elements: <img>, <svg>, <canvas>, downloadable anchors
+            try {
+              const visualItems: string[] = [];
+              const imgs = Array.from(assistantAfterUser.querySelectorAll("img"));
+              for (const img of imgs) {
+                if (img.closest("nav, [class*='avatar' i], [class*='favicon' i]")) continue;
+                const src = img.currentSrc || img.src;
+                const alt = img.getAttribute("alt") || img.getAttribute("aria-label") || "ChatGPT Generated Image";
+                if (src && !src.startsWith("data:image/svg+xml") && (img.width > 40 || img.height > 40 || !img.width)) {
+                  visualItems.push(`- 🖼️ ![${alt}](${src})`);
+                }
+              }
+
+              const svgs = Array.from(assistantAfterUser.querySelectorAll("svg"));
+              for (const svg of svgs) {
+                if (svg.closest("button, nav, [class*='icon' i], [class*='avatar' i]")) continue;
+                const r = svg.getBoundingClientRect();
+                if (r.width > 60 && r.height > 60) {
+                  const labels = Array.from(svg.querySelectorAll("text")).map((t) => t.textContent?.trim()).filter(Boolean);
+                  const title = svg.querySelector("title")?.textContent?.trim() || "Visual Diagram";
+                  visualItems.push(`- 📊 Diagram/SVG: **${title}** (Labels: ${labels.join(" | ") || "visual graph"})`);
+                }
+              }
+
+              const files = Array.from(
+                assistantAfterUser.querySelectorAll("a[download], a[href*='/sandbox:'], a[href*='.pdf'], a[href*='.csv']"),
+              );
+              for (const f of files) {
+                const href = f.getAttribute("href") || "";
+                const name = f.textContent?.trim() || f.getAttribute("download") || "Downloadable File";
+                if (href) visualItems.push(`- 📎 File: [${name}](${href})`);
+              }
+
+              if (visualItems.length > 0) {
+                visualArtifactsText = `\n\n---\n### 🎨 Multimodal Generated Artifacts:\n${visualItems.join("\n")}`;
+              }
+            } catch {}
+          }
+
+          if (currentTurnText && visualArtifactsText) {
+            currentTurnText += visualArtifactsText;
           }
 
           // Universal Modern UI Fallback: Extract from main.innerText via 'ChatGPT said:'
@@ -836,7 +879,38 @@ export class ChatGPTProvider {
           }
         } catch {}
 
-        return (baseText + canvasBlock).trim();
+        // 5. Harvest multimodal elements: <img>, <svg>, <canvas>, downloadable anchors
+        let visualBlock = "";
+        try {
+          const visualItems: string[] = [];
+          const lastMsg = assistantMsgs.length > 0 ? assistantMsgs[assistantMsgs.length - 1] : document.body;
+          const imgs = Array.from(lastMsg.querySelectorAll("img"));
+          for (const img of imgs) {
+            if (img.closest("nav, [class*='avatar' i], [class*='favicon' i]")) continue;
+            const src = img.currentSrc || img.src;
+            const alt = img.getAttribute("alt") || img.getAttribute("aria-label") || "ChatGPT Generated Image";
+            if (src && !src.startsWith("data:image/svg+xml") && (img.width > 40 || img.height > 40 || !img.width)) {
+              visualItems.push(`- 🖼️ ![${alt}](${src})`);
+            }
+          }
+
+          const svgs = Array.from(lastMsg.querySelectorAll("svg"));
+          for (const svg of svgs) {
+            if (svg.closest("button, nav, [class*='icon' i], [class*='avatar' i]")) continue;
+            const r = svg.getBoundingClientRect();
+            if (r.width > 60 && r.height > 60) {
+              const labels = Array.from(svg.querySelectorAll("text")).map((t) => t.textContent?.trim()).filter(Boolean);
+              const title = svg.querySelector("title")?.textContent?.trim() || "Visual Diagram";
+              visualItems.push(`- 📊 Diagram/SVG: **${title}** (Labels: ${labels.join(" | ") || "visual graph"})`);
+            }
+          }
+
+          if (visualItems.length > 0) {
+            visualBlock = `\n\n---\n### 🎨 Multimodal Generated Artifacts:\n${visualItems.join("\n")}`;
+          }
+        } catch {}
+
+        return (baseText + canvasBlock + visualBlock).trim();
       });
 
       return this.cleanResponse(responseText);
