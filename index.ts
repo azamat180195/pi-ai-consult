@@ -441,7 +441,8 @@ MANDATORY: stop looping. Report to the user in Uzbek: what was asked, what was s
       return {
         status: "NEEDS_FOLLOWUP",
         text: `STATUS: NEEDS_FOLLOWUP (${tag}, detected via ${r.source}) — the external AI is WAITING for additional information/evidence. Your turn is NOT finished!
-MANDATORY NEXT ACTION (do not report to the user yet, do not guess):
+MANDATORY NEXT ACTION:
+VISIBILITY RULE (CRITICAL): Before executing any tools, write 1-2 visible sentences to the user in Uzbek: "${r.source || "AI"} javob berdi: <asosiy xulosa>. Hozir so'ralgan ma'lumotlarni tekshirib, davom ettiraman..." (NEEDS_FOLLOWUP means do NOT write the final definitive report yet; it NEVER means stay silent!).
 1. Collect EXACTLY these items with your tools (bash/read/grep). Verbatim output only:
 ${items}
 2. Call this same tool again: newChat:false, intent:"evidence", evidence:[{needId, kind, source, content}] — one entry per ID.
@@ -685,11 +686,25 @@ Structure:
         await ChatStore.setLoop(provider, nextLoop);
 
         const d = buildDirective(parsed, nextLoop, false);
+
+        // Human-friendly digest for TUI collapsed view and notification
+        const rawBody = parsed.body || result.text || "";
+        const bodyLines = rawBody.split("\n").map((l: string) => l.trim()).filter(Boolean);
+        const snippet = bodyLines.slice(0, 3).join(" ").slice(0, 220);
+        const summaryHeader = `◆ [${provider.toUpperCase()} JAVOBI KELDI] · ${bodyLines.length} qator · holat: ${parsed.state}\n  Xulosa: ${snippet || "Javob muvaffaqiyatli qabul qilindi"}...\n`;
+
+        if (ctx?.ui?.notify) {
+          ctx.ui.notify(
+            `💬 [ai-consult]: ${provider.toUpperCase()} javob berdi (${bodyLines.length} qator, ${parsed.state}) · ko'rib chiqilmoqda...`,
+            "info",
+          );
+        }
+
         return {
           content: [
             {
               type: "text",
-              text: `=== AI-CONSULT RESULT === provider:${provider} chat:${result.chatUrl ?? "?"}\n${d.text}\n\n--- EXTERNAL AI RESPONSE (${result.modelUsed || provider}) ---\n${parsed.body || result.text}`,
+              text: `${summaryHeader}\n=== AI-CONSULT RESULT === provider:${provider} chat:${result.chatUrl ?? "?"}\n${d.text}\n\n--- EXTERNAL AI RESPONSE (${result.modelUsed || provider}) ---\n${rawBody}`,
             },
           ],
           details: {
