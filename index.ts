@@ -292,7 +292,12 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     ),
     source: Type.String({ description: "Exact command executed, or file path[:lines]" }),
     content: Type.String({ description: "VERBATIM output or content. Never summarize or paraphrase." }),
-    status: Type.Optional(Type.Union([Type.Literal("ok"), Type.Literal("unavailable")])),
+    status: Type.Optional(
+      Type.String({
+        maxLength: 64,
+        description: "Canonical: ok | unavailable. Aliases accepted: verified, ran_locally, provided, confirmed.",
+      }),
+    ),
     note: Type.Optional(Type.String({ description: "Why unavailable, or what was truncated (English)" })),
   });
 
@@ -384,6 +389,20 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
   }
 
   function validateCall(p: any, loop: LoopState, isNew: boolean): string | null {
+    // Normalize evidence status strings
+    if (Array.isArray(p.evidence)) {
+      for (const item of p.evidence) {
+        if (item && typeof item === "object") {
+          const s = String(item.status || "ok").toLowerCase().trim();
+          if (["unavailable", "missing", "failed", "error", "none", "n/a"].includes(s)) {
+            item.status = "unavailable";
+          } else {
+            item.status = "ok";
+          }
+        }
+      }
+    }
+
     if (isNew && isLoopOpen(loop) && !p.abandonLoop) {
       return `An active consult loop is currently open with pending requests: ${loop.pending.map((n) => n.id).join(", ")}. Continue with newChat: false (intent='evidence', 'challenge', or 'clarify'), or set abandonLoop: true if the user explicitly cancelled.`;
     }

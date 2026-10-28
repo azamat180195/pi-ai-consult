@@ -334,26 +334,73 @@ export class ChatGPTProvider {
       await this.ensureThinkMode(page);
     }
 
-    // 3. Locate Input
-    const inputSelector = [
-      "#prompt-textarea",
-      'div#prompt-textarea[contenteditable="true"]',
-      'div.ProseMirror[contenteditable="true"]',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[aria-label*="Ask ChatGPT" i]',
-      "textarea",
-    ].join(", ");
+    // 3. Locate & Verify True Chat Composer (Strictly excluding code blocks in assistant history)
+    const COMPOSER_ATTR = "data-aic-composer";
+    const composerProbe = await page.evaluate(
+      ({ attr }) => {
+        document.querySelectorAll(`[${attr}]`).forEach((n) => n.removeAttribute(attr));
 
-    let inputLocator = page.locator(inputSelector).first();
-    try {
-      await inputLocator.waitFor({ state: "visible", timeout: 20000 });
-    } catch {
+        const FOREIGN =
+          'article, pre, code, .cm-editor, .cm-content, .cm-scroller, .cm-line, ' +
+          '[data-message-author-role], [data-turn-key], [data-content-search-turn-key], ' +
+          '[data-testid^="conversation-turn"], [role="log"], [role="dialog"]';
+
+        const isVisible = (el: Element) => {
+          const r = el.getBoundingClientRect();
+          const cs = getComputedStyle(el);
+          return r.width > 20 && r.height > 10 && cs.display !== "none" && cs.visibility !== "hidden";
+        };
+
+        const isEditable = (el: Element) =>
+          el instanceof HTMLTextAreaElement || (el as HTMLElement).isContentEditable === true;
+
+        const isComposer = (el: Element | null, requireForm = true): boolean => {
+          if (!el || !isEditable(el)) return false;
+          if (el.closest(FOREIGN)) return false;
+          if (requireForm && !el.closest("form")) return false;
+          return isVisible(el);
+        };
+
+        // Tier 1: Look inside form for canonical #prompt-textarea or contenteditable
+        let cands = Array.from(
+          document.querySelectorAll<HTMLElement>('form #prompt-textarea, form [contenteditable="true"], form textarea'),
+        ).filter((e) => isComposer(e, true));
+
+        // Tier 2: If ChatGPT dropped <form>, check canonical #prompt-textarea outside FOREIGN
+        if (!cands.length) {
+          cands = Array.from(document.querySelectorAll<HTMLElement>("#prompt-textarea, div#prompt-textarea")).filter((e) =>
+            isComposer(e, false),
+          );
+        }
+
+        if (!cands.length) return { ok: false, reason: "no-candidate" };
+
+        // Score: #prompt-textarea wins (+100), ProseMirror (+20), lower on screen wins
+        const score = (el: HTMLElement) => {
+          let s = 0;
+          if (el.id === "prompt-textarea") s += 100;
+          if (el.classList.contains("ProseMirror")) s += 20;
+          s += el.getBoundingClientRect().bottom / Math.max(1, window.innerHeight);
+          return s;
+        };
+
+        cands.sort((a, b) => score(b) - score(a));
+        const best = cands[0];
+        best.setAttribute(attr, "1");
+        return { ok: true, id: best.id, tag: best.tagName };
+      },
+      { attr: COMPOSER_ATTR },
+    );
+
+    if (!composerProbe.ok) {
       return {
         success: false,
         text: "",
-        error: "ChatGPT prompt kiritish maydoni topilmadi. Sahifa yuklanishida xatolik bo'lishi mumkin.",
+        error: "ChatGPT asosiy prompt kiritish maydoni topilmadi. Sahifada xatolik bo'lishi mumkin.",
       };
     }
+
+    const inputLocator = page.locator(`[${COMPOSER_ATTR}="1"]`).first();
 
     // 4. Input Prompt (clean any drafts, use synthetic paste for reliable ProseMirror state)
     // Wait up to 15s for any in-flight stream/stop button to settle before sending
@@ -378,7 +425,25 @@ export class ChatGPTProvider {
     }
 
     await this.sweepOverlays(page);
+    await inputLocator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
     await inputLocator.click({ timeout: 5000 }).catch(() => inputLocator.focus());
+
+    // GATE 1: Verify focus is actually on the composer and NOT on a code editor
+    const focusCheck = await page.evaluate(
+      ({ attr }) => {
+        let a = document.activeElement as HTMLElement | null;
+        if (a && !(a instanceof HTMLTextAreaElement)) {
+          a = a.closest<HTMLElement>('[contenteditable="true"]') ?? a;
+        }
+        return !!a && a.getAttribute(attr) === "1";
+      },
+      { attr: COMPOSER_ATTR },
+    );
+
+    if (!focusCheck) {
+      await inputLocator.evaluate((el) => (el as HTMLElement).focus());
+    }
+
     await page.keyboard.press("ControlOrMeta+a");
     await page.keyboard.press("Backspace");
     await page.waitForTimeout(200);
@@ -396,6 +461,30 @@ export class ChatGPTProvider {
     if (!entered.includes(nonce)) {
       await page.keyboard.insertText(promptToSend);
       await page.waitForTimeout(500);
+    }
+
+    // GATE 2: Leak check — ensure nonce did NOT leak into any .cm-content or code block
+    const leakCheck = await page.evaluate(
+      ({ attr, n }) => {
+        let leaks = 0;
+        const composer = document.querySelector(`[${attr}="1"]`);
+        document.querySelectorAll<HTMLElement>(".cm-content, pre, code").forEach((x) => {
+          if (x === composer || composer?.contains(x)) return;
+          if ((x.textContent || "").includes(n)) leaks++;
+        });
+        return leaks;
+      },
+      { attr: COMPOSER_ATTR, n: nonce },
+    );
+
+    if (leakCheck > 0) {
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      return {
+        success: false,
+        text: "",
+        error:
+          "🛑 [ChatGPT Selector Xatosi]: Prompt chat maydoniga emas, tarixiy kod blokiga tushib qoldi. Sahifa qayta yuklandi, iltimos qayta urinib ko'ring.",
+      };
     }
 
     // 5. Submit Message via Multi-Rung Submission Ladder
@@ -438,19 +527,22 @@ export class ChatGPTProvider {
     // Rung 3: Native HTML form.requestSubmit()
     if (!sent) {
       try {
-        sent = await page.evaluate((sel) => {
-          const form = document.querySelector(sel)?.closest("form");
-          if (form) {
-            const btn = form.querySelector<HTMLButtonElement>('button[type="submit"], button[aria-label*="Send" i]');
-            if (btn && !btn.disabled) {
-              (form as any).requestSubmit(btn);
+        sent = await page.evaluate(
+          ({ attr }) => {
+            const form = document.querySelector(`[${attr}="1"]`)?.closest("form");
+            if (form) {
+              const btn = form.querySelector<HTMLButtonElement>('button[type="submit"], button[aria-label*="Send" i]');
+              if (btn && !btn.disabled) {
+                (form as any).requestSubmit(btn);
+                return true;
+              }
+              (form as any).requestSubmit();
               return true;
             }
-            (form as any).requestSubmit();
-            return true;
-          }
-          return false;
-        }, inputSelector);
+            return false;
+          },
+          { attr: COMPOSER_ATTR },
+        );
       } catch {}
     }
 
