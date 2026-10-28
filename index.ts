@@ -585,10 +585,11 @@ Structure:
 
     const projectLabel = ChatStore.getProjectLabel();
     const shortChat = lastChat?.chatUrl ? lastChat.chatUrl.split("/").pop() : "";
+    const exchangeNumber = (lastChat?.turns ?? 0) + 1;
 
     if (!isNew && ctx?.ui?.notify) {
       ctx.ui.notify(
-        `↻ [ai-consult]: ${provider.toUpperCase()} chat DAVOM ettirildi · loyiha: ${projectLabel} · ${shortChat} · ${(lastChat?.turns ?? 0) + 1}-navbat`,
+        `↻ [ai-consult]: ${provider.toUpperCase()} suhbati DAVOM ettirildi · loyiha: ${projectLabel} · ${shortChat} · shu suhbatdagi ${exchangeNumber}-savol (kutish navbati emas)`,
         "info",
       );
     } else if (isNew && ctx?.ui?.notify) {

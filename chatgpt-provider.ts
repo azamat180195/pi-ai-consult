@@ -357,13 +357,24 @@ export class ChatGPTProvider {
 
     // 4. Input Prompt (clean any drafts, use synthetic paste for reliable ProseMirror state)
     // Wait up to 15s for any in-flight stream/stop button to settle before sending
+    // Pre-Submission Barrier: Ensure any previous turn (thinking, web searching, or streaming)
+    // has completely finished before typing a new prompt. Wait up to 120s to prevent overlapping collisions!
     const idleWaitStart = Date.now();
-    while (Date.now() - idleWaitStart < 15000) {
+    let idleStreak = 0;
+    while (Date.now() - idleWaitStart < 120000) {
       const isBusy = await page.evaluate(() => {
-        return !!document.querySelector('button[aria-label*="Stop" i], button[data-testid*="stop" i], [data-icon="stop"]');
+        const stop = document.querySelector('button[aria-label*="Stop" i], button[data-testid*="stop" i], [data-icon="stop"]');
+        const isStopVisible = !!stop && (stop as HTMLElement).offsetParent !== null;
+        const streaming = !!document.querySelector('.result-streaming, [class*="streaming"]');
+        return isStopVisible || streaming;
       });
-      if (!isBusy) break;
-      await page.waitForTimeout(500);
+      if (!isBusy) {
+        idleStreak++;
+        if (idleStreak >= 3) break;
+      } else {
+        idleStreak = 0;
+      }
+      await page.waitForTimeout(1000);
     }
 
     await this.sweepOverlays(page);
@@ -712,6 +723,15 @@ export class ChatGPTProvider {
             text: "",
             error: `🛑 [ChatGPT xatosi]: ${generationError.message || "Unknown error"}. ChatGPT serverlarida uzilish yoki yuklama yuqoriligi sababli javob bermadi.`,
           };
+        }
+      }
+
+      // Liveness heartbeat: If Stop button is visible or ChatGPT is actively thinking/searching tools,
+      // update lastGrowth and extend deadline so we never abort mid-thought or mid-web-search!
+      if (status.isStillGenerating || status.isStillThinking || status.hasStop) {
+        lastGrowth = Date.now();
+        if (deadline - Date.now() < 90000) {
+          deadline = Math.min(deadline + 90000, startTime + 900000);
         }
       }
 
