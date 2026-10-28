@@ -363,7 +363,25 @@ export class ClaudeProvider {
         );
 
         if (matchedAssistant) {
-          const text = (matchedAssistant as HTMLElement).innerText.trim();
+          let text = "";
+          try {
+            const clone = matchedAssistant.cloneNode(true) as HTMLElement;
+            clone.querySelectorAll('button, [role="button"], mat-icon, svg, [aria-hidden="true"], [class*="select-none"]').forEach((n) => n.remove());
+            clone.querySelectorAll("pre").forEach((pre) => {
+              const codeEl = pre.querySelector("code") || pre;
+              let lang = "";
+              const langMatch = ((codeEl as HTMLElement).className || pre.className || "").match(/(?:language|lang)-([^\s]+)/i);
+              if (langMatch) lang = langMatch[1].toLowerCase();
+              const codeText = (codeEl.textContent || "").trimEnd();
+              const replacement = document.createElement("div");
+              replacement.textContent = `\n\`\`\`${lang}\n${codeText}\n\`\`\`\n`;
+              pre.replaceWith(replacement);
+            });
+            text = (clone.innerText || clone.textContent || "").trim();
+          } catch {
+            text = (matchedAssistant as HTMLElement).innerText.trim();
+          }
+
           return {
             found: true,
             answered: text.length > 50,
@@ -874,10 +892,6 @@ export class ClaudeProvider {
 
       if (assistantMsgs.length > 0) {
         lastAssistant = assistantMsgs[assistantMsgs.length - 1] as HTMLElement;
-        const resp = lastAssistant.querySelector(
-          '.font-claude-response, .standard-markdown, .font-claude-message'
-        ) as HTMLElement | null;
-        chatText = resp && resp.innerText.trim() ? resp.innerText.trim() : lastAssistant.innerText.trim();
       } else {
         // Fallback: look for response elements
         const candidates = Array.from(
@@ -888,15 +902,53 @@ export class ClaudeProvider {
 
         if (candidates.length > 0) {
           lastAssistant = candidates[candidates.length - 1] as HTMLElement;
-          chatText = lastAssistant.innerText.trim();
         } else {
           const messages = Array.from(
             document.querySelectorAll('[data-testid*="user-message"], [data-testid*="assistant-message"]')
           );
           if (messages.length > 0) {
             lastAssistant = messages[messages.length - 1] as HTMLElement;
-            chatText = lastAssistant.innerText.trim();
           }
+        }
+      }
+
+      if (lastAssistant) {
+        const resp = (lastAssistant.querySelector(
+          '.font-claude-response, .standard-markdown, .font-claude-message'
+        ) || lastAssistant) as HTMLElement;
+
+        // Clean code block extraction: clone, strip button noise ("Copy"), preserve language fences and verbatim indentation
+        try {
+          const clone = resp.cloneNode(true) as HTMLElement;
+          clone.querySelectorAll('button, [role="button"], mat-icon, svg, [aria-hidden="true"], [class*="select-none"]').forEach((n) => n.remove());
+
+          clone.querySelectorAll("pre").forEach((pre) => {
+            const codeEl = pre.querySelector("code") || pre;
+            let lang = "";
+            const langMatch = ((codeEl as HTMLElement).className || pre.className || "").match(/(?:language|lang)-([^\s]+)/i);
+            if (langMatch) {
+              lang = langMatch[1].toLowerCase();
+            } else {
+              // Check header label text in parent wrapper
+              const headerText = Array.from(pre.parentElement?.querySelectorAll("span, div") || []).find(
+                (el) =>
+                  el !== pre &&
+                  !pre.contains(el) &&
+                  el.children.length === 0 &&
+                  /^[a-zA-Z0-9#+-]{1,15}$/.test(el.textContent?.trim() || "") &&
+                  !/copy|run|edit/i.test(el.textContent?.trim() || ""),
+              );
+              if (headerText) lang = headerText.textContent?.trim().toLowerCase() || "";
+            }
+            const codeText = (codeEl.textContent || "").trimEnd();
+            const replacement = document.createElement("div");
+            replacement.textContent = `\n\`\`\`${lang}\n${codeText}\n\`\`\`\n`;
+            pre.replaceWith(replacement);
+          });
+
+          chatText = (clone.innerText || clone.textContent || "").trim();
+        } catch {
+          chatText = resp.innerText?.trim() || lastAssistant.innerText?.trim() || "";
         }
       }
 
@@ -946,7 +998,48 @@ export class ClaudeProvider {
         }
       } catch {}
 
-      return chatText + artifactBlock;
+      // 3. Harvest multimodal elements: <img>, <svg> diagrams, downloadable file links
+      let visualBlock = "";
+      try {
+        if (lastAssistant) {
+          const visualItems: string[] = [];
+          const imgs = Array.from(lastAssistant.querySelectorAll("img"));
+          for (const img of imgs) {
+            if (img.closest("nav, [class*='avatar' i], [class*='favicon' i]")) continue;
+            const src = img.currentSrc || img.src;
+            const alt = img.getAttribute("alt") || img.getAttribute("aria-label") || "Claude Image";
+            if (src && !src.startsWith("data:image/svg+xml") && (img.width > 40 || img.height > 40 || !img.width)) {
+              visualItems.push(`- 🖼️ ![${alt}](${src})`);
+            }
+          }
+
+          const svgs = Array.from(lastAssistant.querySelectorAll("svg"));
+          for (const svg of svgs) {
+            if (svg.closest("button, [role='button'], nav")) continue;
+            const rect = svg.getBoundingClientRect();
+            if (rect.width > 60 && rect.height > 60) {
+              const textEls = Array.from(svg.querySelectorAll("text")).map((t) => t.textContent?.trim()).filter(Boolean);
+              const label = textEls.length > 0 ? textEls.join(" | ") : "Claude Diagram / SVG";
+              visualItems.push(`- 📊 [SVG Diagram: ${label}]`);
+            }
+          }
+
+          const fileLinks = Array.from(lastAssistant.querySelectorAll("a[download], a[href*='/download'], a[href*='/files']"));
+          for (const a of fileLinks) {
+            const href = (a as HTMLAnchorElement).href;
+            const name = a.getAttribute("download") || a.textContent?.trim() || "Download File";
+            if (href) {
+              visualItems.push(`- 📁 [${name}](${href})`);
+            }
+          }
+
+          if (visualItems.length > 0) {
+            visualBlock = `\n\n---\n### 🎨 Claude Visual Elements & Files:\n${visualItems.join("\n")}`;
+          }
+        }
+      } catch {}
+
+      return chatText + artifactBlock + visualBlock;
     });
 
     if (!raw) return "";
