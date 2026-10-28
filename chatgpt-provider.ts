@@ -562,9 +562,40 @@ export class ChatGPTProvider {
           let visualArtifactsText = "";
 
           if (assistantAfterUser) {
-            const md = assistantAfterUser.querySelector('.markdown, [class*="MarkdownRoot"], [class*="response-"]');
-            currentTurnText = ((md as HTMLElement)?.innerText || assistantAfterUser.innerText || "").trim();
+            const md = (assistantAfterUser.querySelector('.markdown, [class*="MarkdownRoot"], [class*="response-"]') ||
+              assistantAfterUser) as HTMLElement;
             hasCopyBtn = !!assistantAfterUser.querySelector('button[aria-label*="Copy" i], button[data-testid*="copy"]');
+
+            // Format code blocks cleanly: clone, strip button noise ("Copy", "Run"), preserve backticks and indentation
+            try {
+              const clone = md.cloneNode(true) as HTMLElement;
+              clone.querySelectorAll('button, [role="button"], mat-icon, svg, [aria-hidden="true"]').forEach((n) => n.remove());
+
+              clone.querySelectorAll("pre").forEach((pre) => {
+                const codeEl = pre.querySelector("code") || pre;
+                let lang = "";
+                const langMatch = (codeEl.className || pre.className || "").match(/(?:language|lang)-([^\s]+)/i);
+                if (langMatch) {
+                  lang = langMatch[1].toLowerCase();
+                } else {
+                  const headerText = Array.from(pre.querySelectorAll("span, div")).find(
+                    (el) =>
+                      el.children.length === 0 &&
+                      /^[a-zA-Z0-9#+-]{1,15}$/.test(el.textContent?.trim() || "") &&
+                      !/copy|run|insert/i.test(el.textContent?.trim() || ""),
+                  );
+                  if (headerText) lang = headerText.textContent?.trim().toLowerCase() || "";
+                }
+                const codeText = (codeEl.textContent || "").trimEnd();
+                const replacement = document.createElement("div");
+                replacement.textContent = `\n\`\`\`${lang}\n${codeText}\n\`\`\`\n`;
+                pre.replaceWith(replacement);
+              });
+
+              currentTurnText = (clone.innerText || clone.textContent || "").trim();
+            } catch {
+              currentTurnText = (md.innerText || assistantAfterUser.innerText || "").trim();
+            }
 
             // Harvest multimodal elements: <img>, <svg>, <canvas>, downloadable anchors
             try {

@@ -516,6 +516,19 @@ export class GeminiProvider {
           t.remove();
         }
 
+        // Clean code blocks: strip copy button decorations, ensure markdown backticks and verbatim indent
+        clone.querySelectorAll('button, [role="button"], mat-icon, [class*="decoration"], .code-block-decoration').forEach((n) => n.remove());
+        clone.querySelectorAll("code-block, pre").forEach((cb) => {
+          const codeEl = cb.querySelector("code") || cb;
+          let lang = "";
+          const langMatch = (codeEl.className || cb.className || "").match(/(?:language|lang)-([^\s]+)/i);
+          if (langMatch) lang = langMatch[1].toLowerCase();
+          const codeText = (codeEl.textContent || "").trimEnd();
+          const rep = document.createElement("div");
+          rep.textContent = `\n\`\`\`${lang}\n${codeText}\n\`\`\`\n`;
+          cb.replaceWith(rep);
+        });
+
         let base = (clone.innerText || clone.textContent || "").trim();
 
         // Check for dedicated code viewer/panels in Gemini
