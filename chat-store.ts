@@ -320,12 +320,16 @@ export class ChatStore {
     const scope = getScopeKey(cwd);
     await mutate((d) => {
       const r = getRec(d, scope, provider);
+      const isNewTurn = !!info.nonce && info.nonce !== r.nonce;
       r.chatUrl = info.chatUrl;
       r.lastPrompt = info.lastPrompt;
-      r.nonce = info.nonce;
       r.rateLimitedUntil = info.rateLimitedUntil;
       r.updatedAt = Date.now();
-      r.turns = (r.turns ?? 0) + 1;
+      // Idempotent turn increment: only count once per unique turnId/nonce (Invariant I1)
+      if (isNewTurn || r.turns === undefined || r.turns === 0) {
+        r.turns = (r.turns ?? 0) + 1;
+      }
+      r.nonce = info.nonce;
       if (r.intent) {
         r.intent.status = "done";
         r.intent.chatUrl = info.chatUrl;

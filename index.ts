@@ -502,18 +502,10 @@ Structure:
       }),
     ),
     intent: Type.Optional(
-      Type.Union(
-        [
-          Type.Literal("initial"),
-          Type.Literal("clarify"),
-          Type.Literal("evidence"),
-          Type.Literal("verify"),
-        ],
-        {
-          description:
-            "initial=new topic (newChat:true). clarify=ask about vague/broken parts of last reply. evidence=supply requested data (evidence[] required). verify=ask it to double-check conclusion.",
-        },
-      ),
+      Type.String({
+        description:
+          "initial = start of a NEW QUESTION (resets the 8-round evidence budget). It does NOT start a new chat: the existing chat thread is reused automatically. clarify = ask about unclear parts. evidence = supply requested data. verify = double-check conclusion.",
+      }),
     ),
     phase: Type.Optional(
       Type.Union(
@@ -539,7 +531,7 @@ Structure:
     newChat: Type.Optional(
       Type.Boolean({
         description:
-          "false (default): continues in the active conversation thread for this project. Pass true ONLY if starting a brand new topic or user explicitly asked for a fresh chat.",
+          "DO NOT SET. The existing chat thread is automatically continued to preserve conversational context. Pass true ONLY if the user explicitly commanded to open a fresh chat ('yangi chat och', 'start a new chat').",
       }),
     ),
     newChatReason: Type.Optional(
@@ -553,7 +545,7 @@ Structure:
     evidence: Type.Optional(Type.Array(EvidenceSchema, { maxItems: 8 })),
     abandonLoop: Type.Optional(
       Type.Boolean({
-        description: "Set true only if user explicitly asked to cancel an ongoing consult loop and start fresh.",
+        description: "Deprecated. Only closes the intermediate evidence loop. Never affects the persistent chat thread.",
       }),
     ),
     timeoutSeconds: Type.Optional(
@@ -584,23 +576,31 @@ Structure:
     }
 
     const lastChat = await ChatStore.getLastChat(provider);
-    const hasHealthyChat = !!lastChat?.chatUrl && (lastChat.turns ?? 0) < 35;
+    const hasHealthyChat = !!lastChat?.chatUrl && (lastChat.turns ?? 0) < 30;
+
+    // Detect explicit user command for a new chat (Invariant I4)
+    const userWantsNewChat =
+      params.newChatReason === "user_directive" ||
+      /\b(yangi\s+chat|yangi\s+suhbat|toza\s+chat|boshidan\s+boshla|new\s+chat|fresh\s+chat|start\s+new\s+chat|clean\s+chat|open\s+new\s+chat)\b/i.test(
+        params.prompt || "",
+      );
 
     let isNew = false;
     let reasonLabel = typeof params.newChatReason === "string" ? params.newChatReason.trim() : "";
 
-    if (params.newChat === true) {
-      // INVARIANT: Explicit newChat=true is absolute and NEVER overridden
+    if (params.newChat === true && userWantsNewChat) {
       isNew = true;
-      if (!reasonLabel) reasonLabel = "explicit_new_chat";
-    } else if (params.newChat === false) {
-      // INVARIANT: Explicit newChat=false resumes the scoped record (or opens new if no record exists)
-      isNew = !hasHealthyChat;
-      if (isNew && !reasonLabel) reasonLabel = "no_active_record";
+      if (!reasonLabel) reasonLabel = "user_directive";
+    } else if (params.newChat === true && !hasHealthyChat) {
+      isNew = true;
+      if (!reasonLabel) reasonLabel = "no_active_record";
+    } else if (!hasHealthyChat) {
+      isNew = true;
+      if (!reasonLabel) reasonLabel = "initial_topic";
     } else {
-      // Default: continue healthy scoped chat, or start new if none exists
-      isNew = !hasHealthyChat;
-      if (isNew && !reasonLabel) reasonLabel = "initial_topic";
+      // INVARIANT (Anti-Drift): Thread continuity is default! Even if model passes newChat=true,
+      // reuse the existing thread to keep conversational context.
+      isNew = false;
     }
 
     const projectLabel = ChatStore.getProjectLabel();
@@ -619,7 +619,11 @@ Structure:
       );
     }
 
-    const loop = params.abandonLoop ? emptyLoop() : await ChatStore.getLoop(provider);
+    // Decouple LoopState from Thread continuity (Invariant I3)
+    const isNewQuestion = !params.intent || params.intent === "initial" || params.phase === "brief" || params.abandonLoop;
+    const rawLoop = await ChatStore.getLoop(provider);
+    const loop = (isNewQuestion || rawLoop.state === "FINAL") ? emptyLoop() : rawLoop;
+
     const callError = validateCall(params, loop, isNew);
     if (callError) {
       return {
@@ -695,12 +699,13 @@ Structure:
         const needsKey = parsed.needs.map((n) => `${n.kind}:${n.how ?? n.what}`).sort().join("|");
         const stuck = params.intent === "evidence" && parsed.state === "NEED_INFO" && needsKey && needsKey === loop.lastNeedsKey;
 
+        const isFinal = parsed.state === "FINAL";
         const nextLoop: LoopState = {
-          round: (isNew ? 0 : loop.round) + 1,
+          round: isFinal ? 0 : (isNewQuestion ? 1 : loop.round + 1),
           state: parsed.state,
-          pending: parsed.state === "NEED_INFO" ? parsed.needs : [],
+          pending: isFinal ? [] : (parsed.state === "NEED_INFO" ? parsed.needs : []),
           lastNeedsKey: needsKey,
-          nudges: stuck ? -1 : (isNew ? 0 : loop.nudges),
+          nudges: stuck ? -1 : (isNewQuestion ? 0 : loop.nudges),
         };
         await ChatStore.setLoop(provider, nextLoop);
 
