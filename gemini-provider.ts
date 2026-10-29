@@ -19,46 +19,170 @@ export interface GeminiConsultResult {
   error?: string;
 }
 
+export type GeminiAuthState = "in" | "out" | "unknown";
+
+interface GeminiSignals {
+  url: string;
+  readyState: string;
+  editor: boolean;
+  hero: boolean;
+  accountBtn: boolean;
+  signOutLink: boolean;
+  historyItems: boolean;
+  proBadge: boolean;
+  signInLink: boolean;
+  signInText: boolean;
+}
+
+const ACCOUNT_LABEL_RE =
+  "(google\\s*account|аккаунт\\s*google|google\\s*аккаунт|google\\s*hisob|google\\s*akkaunt)";
+const SIGNIN_TEXT_RE =
+  "^(sign\\s*in|log\\s*in|войти|вход|kirish|tizimga\\s*kirish|hisobga\\s*kirish)$";
+const PRO_RE = "^(pro|advanced|ultra|plus)$";
+
 export class GeminiProvider {
-  public static async isLogged(page: Page): Promise<boolean> {
-    const url = page.url();
-    if (url.includes("accounts.google.com") && !url.includes("RotateCookiesPage")) return false;
+  public static async readSignals(page: Page): Promise<GeminiSignals> {
+    return page.evaluate(
+      ({ accRe, signRe, proRe }) => {
+        const acc = new RegExp(accRe, "i");
+        const sign = new RegExp(signRe, "i");
+        const pro = new RegExp(proRe, "i");
 
-    return await page.evaluate(() => {
-      if (!document.body) return false;
-      const bodyText = document.body.innerText || document.body.textContent || "";
+        const visible = (el: Element): boolean => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const st = getComputedStyle(el as HTMLElement);
+          return st.visibility !== "hidden" && st.display !== "none" && st.opacity !== "0";
+        };
+        const all = (sel: string) => Array.from(document.querySelectorAll(sel));
+        const anyVisible = (sel: string) => all(sel).some(visible);
 
-      // 1. Positive proof: has user profile / Pro badge / sidebar chat history / Argon button
-      const hasPro = !!bodyText.match(/\b(Pro|Advanced)\b/i);
-      const hasRecentChats = document.querySelectorAll('a[href*="/app/"]').length > 1;
-      const hasArgonBtn = Array.from(document.querySelectorAll('button, [role="button"]')).some((b) => {
-        const t = (b.textContent || "").trim();
-        return t === "Argon" || t.includes("Argon") || t.includes("4 Argon");
-      });
-      const hasAvatar = !!document.querySelector(
-        'a[href*="SignOutOptions"], [aria-label*="Google Account" i], [aria-label*="Аккаунт Google" i], [data-testid*="user"], img[src*="googleusercontent.com"]',
-      );
+        const labelled = all("a[aria-label],button[aria-label],[role='button'][aria-label]");
+        const accountBtn = labelled.some(
+          (el) => acc.test(el.getAttribute("aria-label") || "") && visible(el),
+        );
+        const signOutLink =
+          all(
+            "a[href*='accounts.google.com/SignOutOptions'],a[href*='accounts.google.com/Logout']",
+          ).length > 0;
 
-      if (hasArgonBtn || hasRecentChats || hasPro || hasAvatar) {
-        return true;
+        const signInLink = anyVisible(
+          "a[href*='accounts.google.com/ServiceLogin']," +
+            "a[href*='accounts.google.com/v3/signin']," +
+            "a[href*='accounts.google.com/signin']",
+        );
+        const signInText = all("a,button").some(
+          (el) => visible(el) && sign.test((el.textContent || "").trim()),
+        );
+
+        const historyItems = anyVisible(
+          "conversations-list, [data-test-id='conversation'], side-navigation-v2 .conversation, a[href^='/app/']",
+        );
+        const proBadge = all("span,div").some(
+          (el) => el.children.length === 0 && visible(el) && pro.test((el.textContent || "").trim()),
+        );
+
+        const editor = anyVisible("rich-textarea, .ql-editor, div[contenteditable='true'][role='textbox']");
+        const hero = anyVisible("bard-sidenav-container, chat-window, .zero-state-container, h1");
+
+        return {
+          url: location.href,
+          readyState: document.readyState,
+          editor,
+          hero,
+          accountBtn,
+          signOutLink,
+          historyItems,
+          proBadge,
+          signInLink,
+          signInText,
+        };
+      },
+      { accRe: ACCOUNT_LABEL_RE, signRe: SIGNIN_TEXT_RE, proRe: PRO_RE },
+    );
+  }
+
+  public static async detectAuth(
+    page: Page,
+    opts: { timeoutMs?: number; intervalMs?: number; outStableCount?: number } = {},
+  ): Promise<GeminiAuthState> {
+    const { timeoutMs = 15_000, intervalMs = 350, outStableCount = 3 } = opts;
+    const deadline = Date.now() + timeoutMs;
+    let outStreak = 0;
+
+    while (Date.now() < deadline) {
+      if (page.isClosed()) return "unknown";
+
+      let s: GeminiSignals | null = null;
+      try {
+        s = await this.readSignals(page);
+      } catch {
+        outStreak = 0;
+        await page.waitForTimeout(intervalMs);
+        continue;
       }
 
-      // 2. Fallback check: is there a prominent visible "Sign in" button in the top-right header?
-      const headerBtns = Array.from(
-        document.querySelectorAll(
-          'header a, header button, [role="banner"] a, [role="banner"] button, div.top-bar a, div.top-bar button',
-        ),
-      );
-      const hasVisibleSignIn = headerBtns.some((el) => {
-        const text = (el.textContent || "").trim().toLowerCase();
-        const aria = (el.getAttribute("aria-label") || "").toLowerCase();
-        const isSignInText =
-          text === "sign in" || text === "войти" || text === "kirish" || aria.includes("sign in") || aria.includes("войти");
-        return isSignInText && (el as HTMLElement).offsetParent !== null;
-      });
+      // Hard "out": top frame redirected to Google sign-in
+      if (/^https:\/\/accounts\.google\.com\/(v3\/)?(signin|ServiceLogin)/.test(s.url)) {
+        if (++outStreak >= 2) return "out";
+        await page.waitForTimeout(intervalMs);
+        continue;
+      }
 
-      return !hasVisibleSignIn;
-    });
+      // Strong "in": Account avatar button or sign-out link present
+      if (s.accountBtn || s.signOutLink) return "in";
+
+      // Weak "in": chat history present and no sign-in affordance
+      if (s.historyItems && !s.signInLink && !s.signInText && s.editor) return "in";
+      if (s.proBadge && !s.signInLink && !s.signInText) return "in";
+
+      // Hydration check: only declare "out" if page has hydrated AND sign-in link is stably visible
+      const hydrated = s.readyState !== "loading" && (s.editor || s.hero);
+      if (hydrated && (s.signInLink || s.signInText)) {
+        if (++outStreak >= outStableCount) return "out";
+      } else {
+        outStreak = 0;
+      }
+      await page.waitForTimeout(intervalMs);
+    }
+    return "unknown";
+  }
+
+  public static async isLogged(page: Page): Promise<boolean> {
+    return (await this.detectAuth(page, { timeoutMs: 5000 })) !== "out";
+  }
+
+  public static async ensureGeminiReady(page: Page, targetUrl?: string, forceNew = false): Promise<void> {
+    const APP = "https://gemini.google.com/app";
+    const cur = page.url();
+    const onGemini = cur.startsWith("https://gemini.google.com");
+
+    const wantUrl = targetUrl || APP;
+    const needNav =
+      !onGemini ||
+      (targetUrl ? cur !== targetUrl && !cur.includes(targetUrl) : false) ||
+      (forceNew && !targetUrl);
+
+    if (needNav) {
+      await page
+        .goto(wantUrl, { waitUntil: "domcontentloaded", timeout: 45_000 })
+        .catch((e: any) => {
+          if (!page.url().includes("google.com")) throw e;
+        });
+    }
+
+    // Hydration barrier: wait up to 15s for the SPA to render editor or layout
+    await page
+      .waitForFunction(
+        () =>
+          document.readyState !== "loading" &&
+          !!document.querySelector(
+            "rich-textarea, .ql-editor, div[contenteditable='true'], textarea, bard-sidenav-container, chat-window",
+          ),
+        undefined,
+        { timeout: 15_000 },
+      )
+      .catch(() => {});
   }
 
   public static async setModelAndReasoning(
@@ -313,33 +437,27 @@ export class GeminiProvider {
       }
     }
 
-    if (!page.url().startsWith("https://gemini.google.com") || (targetUrl && page.url() !== targetUrl && !page.url().includes(targetUrl))) {
-      await page.goto(targetUrl || "https://gemini.google.com/app", {
-        waitUntil: "commit",
-        timeout: 45000,
-      });
-      // Progressive wait for Quill editor readiness on slow network
-      const editorWaitStart = Date.now();
-      while (Date.now() - editorWaitStart < 45000) {
-        if (await page.locator("div.ql-editor[role='textbox']").first().isVisible().catch(() => false)) break;
-        await page.waitForTimeout(500);
-      }
-      await page.waitForTimeout(1500);
-    }
+    await this.ensureGeminiReady(page, targetUrl, !!options.newChat);
 
     if (options.newChat) {
       const newChatBtn = page
-        .locator("button:has-text('Новый чат'), [aria-label*='Новый чат'], a:has-text('Новый чат')")
+        .locator("button:has-text('Новый чат'), [aria-label*='Новый чат'], a:has-text('Новый чат'), button:has-text('New chat')")
         .first();
       if ((await newChatBtn.count()) > 0) {
         await newChatBtn.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(1000);
       }
     }
 
-    // 0. Strict Login Check - NEVER consult when logged out!
-    const loggedIn = await this.isLogged(page);
-    if (!loggedIn) {
+    // 0. Strict Login Check (Tri-State with Hydration Barrier)
+    let auth = await this.detectAuth(page, { timeoutMs: 15000 });
+    if (auth === "unknown") {
+      // Retry once after quick settle
+      await page.waitForTimeout(1500);
+      auth = await this.detectAuth(page, { timeoutMs: 6000 });
+    }
+
+    if (auth === "out") {
       return {
         text: "",
         modelUsed: "none",

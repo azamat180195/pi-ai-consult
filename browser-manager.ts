@@ -500,20 +500,24 @@ export class BrowserManager {
   private async internalGetGeminiPage(forceNew = false): Promise<Page> {
     const ctx = await this.ensureContext();
 
-    if (this.geminiPage && !this.geminiPage.isClosed() && !forceNew) {
+    const isGeminiUrl = (u: string) =>
+      (u.startsWith("https://gemini.google.com") || u.startsWith("https://www.gemini.google.com")) &&
+      !u.includes("accounts.google.com");
+
+    // 1. Reuse cached page if still alive
+    if (this.geminiPage && !this.geminiPage.isClosed() && isGeminiUrl(this.geminiPage.url())) {
+      await this.geminiPage.bringToFront().catch(() => {});
       return this.geminiPage;
     }
 
-    // In CDP mode, search existing tabs first
+    // 2. CDP: ALWAYS reuse an existing Gemini tab. forceNew == "new chat", NOT "new tab".
+    // The provider handles resetting or navigating to /app.
     if (this.mode === "cdp") {
-      const existing = ctx.pages().find((p) => {
-        const u = p.url();
-        return (u.startsWith("https://gemini.google.com") || u.startsWith("https://www.gemini.google.com")) && !u.includes("accounts.google.com");
-      });
-      if (existing && !existing.isClosed() && !forceNew) {
+      const existing = ctx.pages().find((p) => !p.isClosed() && isGeminiUrl(p.url()));
+      if (existing) {
         this.geminiPage = existing;
-        await this.geminiPage.bringToFront();
-        return this.geminiPage;
+        await existing.bringToFront().catch(() => {});
+        return existing;
       }
     }
 
@@ -527,12 +531,14 @@ export class BrowserManager {
 
     if (page.url() === "about:blank" || page.url() === "") {
       try {
-        await page.goto("https://gemini.google.com/app", { waitUntil: "commit", timeout: 30000 });
-      } catch {}
+        await page.goto("https://gemini.google.com/app", { waitUntil: "domcontentloaded", timeout: 30000 });
+      } catch (e: any) {
+        if (!page.url().includes("google.com")) throw e;
+      }
     }
 
     this.geminiPage = page;
-    await this.geminiPage.bringToFront();
+    await this.geminiPage.bringToFront().catch(() => {});
     return this.geminiPage;
   }
 
