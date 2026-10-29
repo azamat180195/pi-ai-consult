@@ -2,6 +2,7 @@ import type { Page } from "playwright-core";
 import { ChatStore } from "./chat-store.js";
 import type { ImageFile } from "./image-attachments.js";
 import { ImageAttachSession } from "./image-upload.js";
+import { drainTabIfBusy } from "./browser-tab-lease.js";
 
 export interface GeminiConsultOptions {
   model?: string; // '4 Argon', '3.1 Pro', '3.8 Flash', '3.5 Flash-Lite'
@@ -153,6 +154,7 @@ export class GeminiProvider {
   }
 
   public static async ensureGeminiReady(page: Page, targetUrl?: string, forceNew = false): Promise<void> {
+    await drainTabIfBusy(page, 20000);
     const APP = "https://gemini.google.com/app";
     const cur = page.url();
     const onGemini = cur.startsWith("https://gemini.google.com");

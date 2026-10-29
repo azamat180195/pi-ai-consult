@@ -2,6 +2,7 @@ import type { Page } from "playwright-core";
 import { ChatStore } from "./chat-store.js";
 import type { ImageFile } from "./image-attachments.js";
 import { ImageAttachSession } from "./image-upload.js";
+import { drainTabIfBusy } from "./browser-tab-lease.js";
 
 export interface ConsultResult {
   success: boolean;
@@ -512,6 +513,7 @@ export class ClaudeProvider {
     }
 
     if (!page.url().includes("claude.ai") || (targetUrl && page.url() !== targetUrl && !page.url().includes(targetUrl))) {
+      await drainTabIfBusy(page, 20000);
       await page.goto(targetUrl, {
         waitUntil: "commit",
         timeout: 45000,

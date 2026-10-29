@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn, execSync } from "node:child_process";
 import net from "node:net";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+import { ChatStore } from "./chat-store.js";
 
 export interface BrowserStatus {
   mode: "cdp" | "persistent" | "disconnected";
@@ -21,9 +22,9 @@ export class BrowserManager {
   private mode: "cdp" | "persistent" | "disconnected" = "disconnected";
   private cdpPort = 19222;
   private profileDir = join(homedir(), ".pi", "agent", "ai-consult-profile");
-  private claudePage: Page | null = null;
-  private chatgptPage: Page | null = null;
-  private geminiPage: Page | null = null;
+  private claudePages = new Map<string, Page>();
+  private chatgptPages = new Map<string, Page>();
+  private geminiPages = new Map<string, Page>();
   private inFlightOps = 0;
   private opQueue: Promise<unknown> = Promise.resolve();
   private gen = 0;
@@ -370,176 +371,320 @@ export class BrowserManager {
     this.context.on("close", () => {
       this.context = null;
       this.browser = null;
-      this.claudePage = null;
-      this.chatgptPage = null;
-      this.geminiPage = null;
+      this.claudePages.clear();
+      this.chatgptPages.clear();
+      this.geminiPages.clear();
     });
     this.mode = "persistent";
     return this.context;
   }
 
-  public async getClaudePage(forceNew = false): Promise<Page> {
+  public async getClaudePage(scopeKey = "global", forceNew = false): Promise<Page> {
     try {
-      return await this.internalGetClaudePage(forceNew);
+      return await this.internalGetClaudePage(scopeKey, forceNew);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("closed") || msg.includes("Target page")) {
         this.context = null;
         this.browser = null;
-        this.claudePage = null;
-        return await this.internalGetClaudePage(forceNew);
+        this.claudePages.delete(scopeKey);
+        return await this.internalGetClaudePage(scopeKey, forceNew);
       }
       throw err;
     }
   }
 
-  private async internalGetClaudePage(forceNew = false): Promise<Page> {
+  private async internalGetClaudePage(scopeKey = "global", forceNew = false): Promise<Page> {
     const ctx = await this.ensureContext();
+    const marker = `__aic_tab_v1__:claude:${scopeKey}`;
 
-    if (this.claudePage && !this.claudePage.isClosed() && !forceNew) {
-      return this.claudePage;
+    // 1. In-process cache check
+    const cached = this.claudePages.get(scopeKey);
+    if (cached && !cached.isClosed() && !forceNew) {
+      await cached.bringToFront().catch(() => {});
+      return cached;
     }
 
-    // In CDP mode, search existing tabs first
+    // 2. CDP mode: scan open tabs for matching marker or this scope's chatUrl
     if (this.mode === "cdp") {
-      const existing = ctx.pages().find((p) => p.url().includes("claude.ai"));
-      if (existing && !existing.isClosed() && !forceNew) {
-        this.claudePage = existing;
-        await this.claudePage.bringToFront();
-        return this.claudePage;
+      for (const p of ctx.pages()) {
+        if (p.isClosed()) continue;
+        try {
+          const info = await p
+            .evaluate(() => ({
+              name: window.name,
+              meta: (window as any).__aic_meta__,
+              url: location.href,
+            }))
+            .catch(() => null);
+
+          if (!info) continue;
+
+          // Strong match: window.name tag
+          if (info.name === marker || (info.meta && info.meta.marker === marker)) {
+            this.claudePages.set(scopeKey, p);
+            await p.bringToFront().catch(() => {});
+            return p;
+          }
+
+          // Fallback match: tab URL matches this workspace's saved chat and isn't claimed by another scope
+          const last = await ChatStore.getLastChat("claude", scopeKey).catch(() => null);
+          if (
+            last?.chatUrl &&
+            info.url.startsWith(last.chatUrl) &&
+            (!info.meta || info.meta.scopeKey === scopeKey)
+          ) {
+            await p
+              .evaluate(
+                ({ m, s }) => {
+                  window.name = m;
+                  (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "claude" };
+                },
+                { m: marker, s: scopeKey },
+              )
+              .catch(() => {});
+            this.claudePages.set(scopeKey, p);
+            await p.bringToFront().catch(() => {});
+            return p;
+          }
+        } catch {}
       }
     }
 
-    // Otherwise use first blank page or open new page
-    const pages = ctx.pages();
-    let page: Page | undefined;
-    if (pages.length > 0 && (pages[0].url() === "about:blank" || pages[0].url() === "")) {
-      page = pages[0];
-    } else {
-      page = await ctx.newPage();
-    }
+    // 3. Dedicated tab creation: never steal or navigate another workspace's active tab!
+    const page = await ctx.newPage();
+    await page.addInitScript(
+      ({ m, s }) => {
+        window.name = m;
+        (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "claude" };
+      },
+      { m: marker, s: scopeKey },
+    );
 
-    if (page.url() === "about:blank" || page.url() === "") {
-      try {
-        await page.goto("https://claude.ai/new", { waitUntil: "commit", timeout: 30000 });
-      } catch {}
-    }
+    const last = await ChatStore.getLastChat("claude", scopeKey).catch(() => null);
+    const targetUrl = !forceNew && last?.chatUrl ? last.chatUrl : "https://claude.ai/new";
 
-    this.claudePage = page;
-    await this.claudePage.bringToFront();
-    return this.claudePage;
+    try {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+    } catch {}
+
+    await page
+      .evaluate(
+        ({ m, s }) => {
+          window.name = m;
+          (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "claude" };
+        },
+        { m: marker, s: scopeKey },
+      )
+      .catch(() => {});
+
+    this.claudePages.set(scopeKey, page);
+    await page.bringToFront().catch(() => {});
+    return page;
   }
 
-  public async getChatGPTPage(forceNew = false): Promise<Page> {
+  public async getChatGPTPage(scopeKey = "global", forceNew = false): Promise<Page> {
     try {
-      return await this.internalGetChatGPTPage(forceNew);
+      return await this.internalGetChatGPTPage(scopeKey, forceNew);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("closed") || msg.includes("Target page")) {
         this.context = null;
         this.browser = null;
-        this.chatgptPage = null;
-        return await this.internalGetChatGPTPage(forceNew);
+        this.chatgptPages.delete(scopeKey);
+        return await this.internalGetChatGPTPage(scopeKey, forceNew);
       }
       throw err;
     }
   }
 
-  private async internalGetChatGPTPage(forceNew = false): Promise<Page> {
+  private async internalGetChatGPTPage(scopeKey = "global", forceNew = false): Promise<Page> {
     const ctx = await this.ensureContext();
+    const marker = `__aic_tab_v1__:chatgpt:${scopeKey}`;
 
-    if (this.chatgptPage && !this.chatgptPage.isClosed() && !forceNew) {
-      return this.chatgptPage;
+    const cached = this.chatgptPages.get(scopeKey);
+    if (cached && !cached.isClosed() && !forceNew) {
+      await cached.bringToFront().catch(() => {});
+      return cached;
     }
 
-    // In CDP mode, search existing tabs first
     if (this.mode === "cdp") {
-      const existing = ctx.pages().find((p) => p.url().includes("chatgpt.com"));
-      if (existing && !existing.isClosed() && !forceNew) {
-        this.chatgptPage = existing;
-        await this.chatgptPage.bringToFront();
-        return this.chatgptPage;
+      for (const p of ctx.pages()) {
+        if (p.isClosed()) continue;
+        try {
+          const info = await p
+            .evaluate(() => ({
+              name: window.name,
+              meta: (window as any).__aic_meta__,
+              url: location.href,
+            }))
+            .catch(() => null);
+
+          if (!info) continue;
+
+          if (info.name === marker || (info.meta && info.meta.marker === marker)) {
+            this.chatgptPages.set(scopeKey, p);
+            await p.bringToFront().catch(() => {});
+            return p;
+          }
+
+          const last = await ChatStore.getLastChat("chatgpt", scopeKey).catch(() => null);
+          if (
+            last?.chatUrl &&
+            info.url.startsWith(last.chatUrl) &&
+            (!info.meta || info.meta.scopeKey === scopeKey)
+          ) {
+            await p
+              .evaluate(
+                ({ m, s }) => {
+                  window.name = m;
+                  (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "chatgpt" };
+                },
+                { m: marker, s: scopeKey },
+              )
+              .catch(() => {});
+            this.chatgptPages.set(scopeKey, p);
+            await p.bringToFront().catch(() => {});
+            return p;
+          }
+        } catch {}
       }
     }
 
-    // Otherwise use first blank page or open new page
-    const pages = ctx.pages();
-    let page: Page | undefined;
-    if (pages.length > 0 && (pages[0].url() === "about:blank" || pages[0].url() === "")) {
-      page = pages[0];
-    } else {
-      page = await ctx.newPage();
-    }
+    const page = await ctx.newPage();
+    await page.addInitScript(
+      ({ m, s }) => {
+        window.name = m;
+        (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "chatgpt" };
+      },
+      { m: marker, s: scopeKey },
+    );
 
-    if (page.url() === "about:blank" || page.url() === "") {
-      try {
-        await page.goto("https://chatgpt.com", { waitUntil: "commit", timeout: 30000 });
-      } catch {}
-    }
+    const last = await ChatStore.getLastChat("chatgpt", scopeKey).catch(() => null);
+    const targetUrl = !forceNew && last?.chatUrl ? last.chatUrl : "https://chatgpt.com";
 
-    this.chatgptPage = page;
-    await this.chatgptPage.bringToFront();
-    return this.chatgptPage;
+    try {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+    } catch {}
+
+    await page
+      .evaluate(
+        ({ m, s }) => {
+          window.name = m;
+          (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "chatgpt" };
+        },
+        { m: marker, s: scopeKey },
+      )
+      .catch(() => {});
+
+    this.chatgptPages.set(scopeKey, page);
+    await page.bringToFront().catch(() => {});
+    return page;
   }
 
-  public async getGeminiPage(forceNew = false): Promise<Page> {
+  public async getGeminiPage(scopeKey = "global", forceNew = false): Promise<Page> {
     try {
-      return await this.internalGetGeminiPage(forceNew);
+      return await this.internalGetGeminiPage(scopeKey, forceNew);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("closed") || msg.includes("Target page")) {
         this.context = null;
         this.browser = null;
-        this.geminiPage = null;
-        return await this.internalGetGeminiPage(forceNew);
+        this.geminiPages.delete(scopeKey);
+        return await this.internalGetGeminiPage(scopeKey, forceNew);
       }
       throw err;
     }
   }
 
-  private async internalGetGeminiPage(forceNew = false): Promise<Page> {
+  private async internalGetGeminiPage(scopeKey = "global", forceNew = false): Promise<Page> {
     const ctx = await this.ensureContext();
+    const marker = `__aic_tab_v1__:gemini:${scopeKey}`;
 
     const isGeminiUrl = (u: string) =>
       (u.startsWith("https://gemini.google.com") || u.startsWith("https://www.gemini.google.com")) &&
       !u.includes("accounts.google.com");
 
-    // 1. Reuse cached page if still alive
-    if (this.geminiPage && !this.geminiPage.isClosed() && isGeminiUrl(this.geminiPage.url())) {
-      await this.geminiPage.bringToFront().catch(() => {});
-      return this.geminiPage;
+    const cached = this.geminiPages.get(scopeKey);
+    if (cached && !cached.isClosed() && isGeminiUrl(cached.url()) && !forceNew) {
+      await cached.bringToFront().catch(() => {});
+      return cached;
     }
 
-    // 2. CDP: ALWAYS reuse an existing Gemini tab. forceNew == "new chat", NOT "new tab".
-    // The provider handles resetting or navigating to /app.
     if (this.mode === "cdp") {
-      const existing = ctx.pages().find((p) => !p.isClosed() && isGeminiUrl(p.url()));
-      if (existing) {
-        this.geminiPage = existing;
-        await existing.bringToFront().catch(() => {});
-        return existing;
+      for (const p of ctx.pages()) {
+        if (p.isClosed()) continue;
+        try {
+          const info = await p
+            .evaluate(() => ({
+              name: window.name,
+              meta: (window as any).__aic_meta__,
+              url: location.href,
+            }))
+            .catch(() => null);
+
+          if (!info) continue;
+
+          if (info.name === marker || (info.meta && info.meta.marker === marker)) {
+            this.geminiPages.set(scopeKey, p);
+            await p.bringToFront().catch(() => {});
+            return p;
+          }
+
+          const last = await ChatStore.getLastChat("gemini", scopeKey).catch(() => null);
+          if (
+            last?.chatUrl &&
+            info.url.startsWith(last.chatUrl) &&
+            (!info.meta || info.meta.scopeKey === scopeKey)
+          ) {
+            await p
+              .evaluate(
+                ({ m, s }) => {
+                  window.name = m;
+                  (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "gemini" };
+                },
+                { m: marker, s: scopeKey },
+              )
+              .catch(() => {});
+            this.geminiPages.set(scopeKey, p);
+            await p.bringToFront().catch(() => {});
+            return p;
+          }
+        } catch {}
       }
     }
 
-    const pages = ctx.pages();
-    let page: Page | undefined;
-    if (pages.length > 0 && (pages[0].url() === "about:blank" || pages[0].url() === "")) {
-      page = pages[0];
-    } else {
-      page = await ctx.newPage();
+    const page = await ctx.newPage();
+    await page.addInitScript(
+      ({ m, s }) => {
+        window.name = m;
+        (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "gemini" };
+      },
+      { m: marker, s: scopeKey },
+    );
+
+    const last = await ChatStore.getLastChat("gemini", scopeKey).catch(() => null);
+    const targetUrl = !forceNew && last?.chatUrl ? last.chatUrl : "https://gemini.google.com/app";
+
+    try {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+    } catch (e: any) {
+      if (!page.url().includes("google.com")) throw e;
     }
 
-    if (page.url() === "about:blank" || page.url() === "") {
-      try {
-        await page.goto("https://gemini.google.com/app", { waitUntil: "domcontentloaded", timeout: 30000 });
-      } catch (e: any) {
-        if (!page.url().includes("google.com")) throw e;
-      }
-    }
+    await page
+      .evaluate(
+        ({ m, s }) => {
+          window.name = m;
+          (window as any).__aic_meta__ = { marker: m, scopeKey: s, provider: "gemini" };
+        },
+        { m: marker, s: scopeKey },
+      )
+      .catch(() => {});
 
-    this.geminiPage = page;
-    await this.geminiPage.bringToFront().catch(() => {});
-    return this.geminiPage;
+    this.geminiPages.set(scopeKey, page);
+    await page.bringToFront().catch(() => {});
+    return page;
   }
 
   public async getStatus(): Promise<BrowserStatus> {
@@ -549,8 +694,8 @@ export class BrowserManager {
       profileDir: this.profileDir,
       isHeadless: process.env.PI_AI_CONSULT_HEADLESS === "1",
       chromePath: this.findChromePath(),
-      claudeOpen: !!(this.claudePage && !this.claudePage.isClosed()),
-      chatgptOpen: !!(this.chatgptPage && !this.chatgptPage.isClosed()),
+      claudeOpen: Array.from(this.claudePages.values()).some((p) => !p.isClosed()),
+      chatgptOpen: Array.from(this.chatgptPages.values()).some((p) => !p.isClosed()),
     };
   }
 

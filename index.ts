@@ -30,6 +30,7 @@ import { GeminiProvider } from "./gemini-provider.js";
 import { SecretRedactor } from "./secret-redactor.js";
 import { ChatStore, emptyLoop, isLoopOpen, type LoopState } from "./chat-store.js";
 import { resolveImages, withAttachmentManifest } from "./image-attachments.js";
+import { acquireTabLease } from "./browser-tab-lease.js";
 import { checkEnglish } from "./language-guard.js";
 import {
   PROTOCOL_FOOTER,
@@ -684,6 +685,8 @@ Structure:
     }
 
     const finalPrompt = withAttachmentManifest(safePrompt, resolved.images);
+    const scopeKey = ChatStore.getScopeKey(process.cwd());
+    const lease = await acquireTabLease(provider, scopeKey);
 
     cancelIdleAutoClose();
     browserManager.beginOp();
@@ -692,7 +695,7 @@ Structure:
         let result: any;
         if (provider === "claude") {
           const providerClass = loadClaudeProvider();
-          const page = await browserManager.getClaudePage(isNew);
+          const page = await browserManager.getClaudePage(scopeKey, isNew);
           result = await providerClass.consult(page, finalPrompt, {
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
@@ -702,7 +705,7 @@ Structure:
           });
         } else if (provider === "chatgpt") {
           const providerClass = loadChatGPTProvider();
-          const page = await browserManager.getChatGPTPage(isNew);
+          const page = await browserManager.getChatGPTPage(scopeKey, isNew);
           result = await providerClass.consult(page, finalPrompt, {
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
@@ -711,7 +714,7 @@ Structure:
           });
         } else {
           const providerClass = loadGeminiProvider();
-          const page = await browserManager.getGeminiPage(isNew);
+          const page = await browserManager.getGeminiPage(scopeKey, isNew);
           result = await providerClass.consult(page, finalPrompt, {
             model: options.model ?? "4 Argon",
             reasoning: (options.reasoning as any) ?? "Высокий",
@@ -798,6 +801,7 @@ Structure:
           details: { success: false, error: errMsg },
         };
       } finally {
+        lease.release();
         browserManager.endOp();
         resetIdleAutoClose(25000);
       }

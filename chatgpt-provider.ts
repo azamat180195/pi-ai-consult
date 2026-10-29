@@ -3,6 +3,7 @@ import { ChatStore } from "./chat-store.js";
 import type { ConsultResult } from "./claude-provider.js";
 import type { ImageFile } from "./image-attachments.js";
 import { ImageAttachSession } from "./image-upload.js";
+import { drainTabIfBusy } from "./browser-tab-lease.js";
 
 const PROMO_KEYWORDS =
   "meet codex|download the app|get the app|desktop app|try plus|try chatgpt plus|stay logged in|survey|what's new|new feature|cookie|privacy";
@@ -163,6 +164,7 @@ export class ChatGPTProvider {
    * Robust, slow-network friendly navigation that uses 'commit' plus progressive readiness polling.
    */
   private static async openPage(page: Page, targetUrl: string): Promise<void> {
+    await drainTabIfBusy(page, 20000);
     const isAlreadyThere = page.url().startsWith("https://chatgpt.com") && page.url().split("?")[0] === targetUrl.split("?")[0];
     const composer = page.locator('#prompt-textarea, div[contenteditable="true"][role="textbox"], div.ProseMirror').first();
 
