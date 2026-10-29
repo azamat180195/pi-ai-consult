@@ -29,6 +29,7 @@ import { ChatGPTProvider } from "./chatgpt-provider.js";
 import { GeminiProvider } from "./gemini-provider.js";
 import { SecretRedactor } from "./secret-redactor.js";
 import { ChatStore, emptyLoop, isLoopOpen, type LoopState } from "./chat-store.js";
+import { resolveImages, withAttachmentManifest } from "./image-attachments.js";
 import { checkEnglish } from "./language-guard.js";
 import {
   PROTOCOL_FOOTER,
@@ -548,6 +549,20 @@ Structure:
         description: "Deprecated. Only closes the intermediate evidence loop. Never affects the persistent chat thread.",
       }),
     ),
+    images: Type.Optional(
+      Type.Array(Type.String({ maxLength: 512 }), {
+        maxItems: 20,
+        description:
+          "Local image paths (png/jpg/webp/gif) to ATTACH and upload to the AI for visual inspection. Relative paths resolve against cwd, then OS temp. " +
+          "If your prompt refers to screenshots (1.jpg, bug.png) you MUST list them here; naming them in text attaches nothing. Max 5.",
+      }),
+    ),
+    autoAttachImages: Type.Optional(
+      Type.Boolean({
+        description:
+          "Default true. When images[] is omitted, existing image files named in the prompt (inside cwd/tmp) are attached automatically.",
+      }),
+    ),
     timeoutSeconds: Type.Optional(
       Type.Number({
         description: "Maximum seconds to wait for response (default: 360)",
@@ -642,6 +657,34 @@ Structure:
       );
     }
 
+    // Resolve & Auto-Discover Local Images (Multimodal Attachment)
+    const resolved = await resolveImages({
+      provider,
+      explicit: params.images,
+      prompt: safePrompt,
+      cwd: process.cwd(),
+      autoAttach: params.autoAttachImages !== false,
+    });
+
+    if (resolved.errors.length) {
+      return {
+        content: [{ type: "text", text: `🛑 [Rasm Xatosi]: ${resolved.errors.join("; ")}` }],
+        details: { success: false, error: resolved.errors.join("; ") },
+      };
+    }
+
+    for (const w of resolved.warnings) ctx?.ui?.notify?.(w, "warning");
+    for (const s of resolved.skipped) ctx?.ui?.notify?.(`rasm o'tkazib yuborildi: ${s}`, "warning");
+
+    if (resolved.images.length > 0 && ctx?.ui?.notify) {
+      ctx.ui.notify(
+        `🖼️ [ai-consult]: ${resolved.images.length} ta rasm ${provider.toUpperCase()} ga biriktirilmoqda (${resolved.images.map((i) => i.name).join(", ")})...`,
+        "info",
+      );
+    }
+
+    const finalPrompt = withAttachmentManifest(safePrompt, resolved.images);
+
     cancelIdleAutoClose();
     browserManager.beginOp();
     return browserManager.serialize(async () => {
@@ -650,28 +693,31 @@ Structure:
         if (provider === "claude") {
           const providerClass = loadClaudeProvider();
           const page = await browserManager.getClaudePage(isNew);
-          result = await providerClass.consult(page, safePrompt, {
+          result = await providerClass.consult(page, finalPrompt, {
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
             effort: options.effort ?? "High",
             model: options.model ?? "Sonnet",
+            images: resolved.images,
           });
         } else if (provider === "chatgpt") {
           const providerClass = loadChatGPTProvider();
           const page = await browserManager.getChatGPTPage(isNew);
-          result = await providerClass.consult(page, safePrompt, {
+          result = await providerClass.consult(page, finalPrompt, {
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
             think: options.think ?? true,
+            images: resolved.images,
           });
         } else {
           const providerClass = loadGeminiProvider();
           const page = await browserManager.getGeminiPage(isNew);
-          result = await providerClass.consult(page, safePrompt, {
+          result = await providerClass.consult(page, finalPrompt, {
             model: options.model ?? "4 Argon",
             reasoning: (options.reasoning as any) ?? "Высокий",
             newChat: isNew,
             timeoutSeconds: options.timeoutSeconds,
+            images: resolved.images,
           });
         }
 

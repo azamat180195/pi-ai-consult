@@ -1,6 +1,8 @@
 import type { Page } from "playwright-core";
 import { ChatStore } from "./chat-store.js";
 import type { ConsultResult } from "./claude-provider.js";
+import type { ImageFile } from "./image-attachments.js";
+import { ImageAttachSession } from "./image-upload.js";
 
 const PROMO_KEYWORDS =
   "meet codex|download the app|get the app|desktop app|try plus|try chatgpt plus|stay logged in|survey|what's new|new feature|cookie|privacy";
@@ -205,6 +207,7 @@ export class ChatGPTProvider {
       newChat?: boolean;
       timeoutSeconds?: number;
       think?: boolean;
+      images?: ImageFile[];
     } = {},
   ): Promise<ConsultResult> {
     const timeoutMs = (options.timeoutSeconds ?? 360) * 1000;
@@ -402,6 +405,23 @@ export class ChatGPTProvider {
 
     const inputLocator = page.locator(`[${COMPOSER_ATTR}="1"]`).first();
 
+    // 3.5 Attach Images if provided
+    const imgs = options.images ?? [];
+    let imageSession: ImageAttachSession | undefined;
+    if (imgs.length > 0) {
+      try {
+        imageSession = new ImageAttachSession(page, "chatgpt", inputLocator, imgs);
+        await imageSession.attach();
+      } catch (attachErr: any) {
+        await imageSession?.abort().catch(() => {});
+        return {
+          success: false,
+          text: "",
+          error: `🛑 [Rasm yuklashda xatolik]: ChatGPT ga rasm biriktirish amalga oshmadi: ${attachErr.message}`,
+        };
+      }
+    }
+
     // 4. Input Prompt (clean any drafts, use synthetic paste for reliable ProseMirror state)
     // Wait up to 15s for any in-flight stream/stop button to settle before sending
     // Pre-Submission Barrier: Ensure any previous turn (thinking, web searching, or streaming)
@@ -461,6 +481,20 @@ export class ChatGPTProvider {
     if (!entered.includes(nonce)) {
       await page.keyboard.insertText(promptToSend);
       await page.waitForTimeout(500);
+    }
+
+    // Settlement barrier: ensure images finish uploading and send button becomes active
+    if (imageSession) {
+      try {
+        await imageSession.settle(true);
+      } catch (settleErr: any) {
+        await imageSession.abort().catch(() => {});
+        return {
+          success: false,
+          text: "",
+          error: `🛑 [Rasm yuklanishi tugamadi]: ChatGPT rasmni to'liq yuklab bo'lmadi: ${settleErr.message}`,
+        };
+      }
     }
 
     // GATE 2: Leak check — ensure nonce did NOT leak into any .cm-content or code block
@@ -573,6 +607,11 @@ export class ChatGPTProvider {
         break;
       }
       await page.waitForTimeout(500);
+    }
+
+    if (imageSession) {
+      await imageSession.verifySent().catch(() => {});
+      imageSession.dispose();
     }
 
     // Immediate Write-Ahead URL Capture: As soon as URL transitions to /c/<id>, save immediately!

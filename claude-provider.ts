@@ -1,5 +1,7 @@
 import type { Page } from "playwright-core";
 import { ChatStore } from "./chat-store.js";
+import type { ImageFile } from "./image-attachments.js";
+import { ImageAttachSession } from "./image-upload.js";
 
 export interface ConsultResult {
   success: boolean;
@@ -404,6 +406,7 @@ export class ClaudeProvider {
       timeoutSeconds?: number;
       effort?: "Low" | "Medium" | "High" | "Extra" | "Max" | string;
       model?: string;
+      images?: ImageFile[];
     } = {},
   ): Promise<ConsultResult> {
     const timeoutMs = (options.timeoutSeconds ?? 360) * 1000;
@@ -623,6 +626,23 @@ export class ClaudeProvider {
       };
     }
 
+    // 3.5 Attach Images if provided
+    const imgs = options.images ?? [];
+    let imageSession: ImageAttachSession | undefined;
+    if (imgs.length > 0) {
+      try {
+        imageSession = new ImageAttachSession(page, "claude", inputLocator, imgs);
+        await imageSession.attach();
+      } catch (attachErr: any) {
+        await imageSession?.abort().catch(() => {});
+        return {
+          success: false,
+          text: "",
+          error: `🛑 [Rasm yuklashda xatolik]: Claude ga rasm biriktirish amalga oshmadi: ${attachErr.message}`,
+        };
+      }
+    }
+
     // 4. Input Prompt
     try {
       await inputLocator.click({ timeout: 4000 });
@@ -638,6 +658,20 @@ export class ClaudeProvider {
     // Fast, reliable multiline text insertion without typing char-by-char
     await page.keyboard.insertText(promptToSend);
     await page.waitForTimeout(500);
+
+    // Settlement barrier: ensure images finish uploading and send button becomes active
+    if (imageSession) {
+      try {
+        await imageSession.settle(true);
+      } catch (settleErr: any) {
+        await imageSession.abort().catch(() => {});
+        return {
+          success: false,
+          text: "",
+          error: `🛑 [Rasm yuklanishi tugamadi]: Claude rasmni to'liq yuklab bo'lmadi: ${settleErr.message}`,
+        };
+      }
+    }
 
     // 5. Submit Message
     const sendBtnSelector = [
@@ -664,6 +698,11 @@ export class ClaudeProvider {
     }
 
     await page.waitForTimeout(1200);
+
+    if (imageSession) {
+      await imageSession.verifySent().catch(() => {});
+      imageSession.dispose();
+    }
 
     // If Claude shows a "Use caution before running this prompt" safety prompt, dismiss/confirm it
     try {

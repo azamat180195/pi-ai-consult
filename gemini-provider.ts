@@ -1,11 +1,14 @@
 import type { Page } from "playwright-core";
 import { ChatStore } from "./chat-store.js";
+import type { ImageFile } from "./image-attachments.js";
+import { ImageAttachSession } from "./image-upload.js";
 
 export interface GeminiConsultOptions {
   model?: string; // '4 Argon', '3.1 Pro', '3.8 Flash', '3.5 Flash-Lite'
   reasoning?: string; // 'Высокая', 'Средний', 'Низкая'
   newChat?: boolean;
   timeoutSeconds?: number;
+  images?: ImageFile[];
 }
 
 export interface GeminiConsultResult {
@@ -439,6 +442,25 @@ export class GeminiProvider {
       };
     }
 
+    // 3.5 Attach Images if provided
+    const imgs = options.images ?? [];
+    let imageSession: ImageAttachSession | undefined;
+    if (imgs.length > 0) {
+      try {
+        imageSession = new ImageAttachSession(page, "gemini", editor, imgs);
+        await imageSession.attach();
+      } catch (attachErr: any) {
+        await imageSession?.abort().catch(() => {});
+        return {
+          text: "",
+          modelUsed,
+          reasoningUsed,
+          success: false,
+          error: `🛑 [Rasm yuklashda xatolik]: Gemini ga rasm biriktirish amalga oshmadi: ${attachErr.message}`,
+        };
+      }
+    }
+
     await editor.click({ force: true });
     await page.waitForTimeout(200);
 
@@ -450,6 +472,22 @@ export class GeminiProvider {
     // Type prompt via native keyboard insertText (bypasses TrustedHTML restriction)
     await page.keyboard.insertText(prompt);
     await page.waitForTimeout(800);
+
+    // Settlement barrier: ensure images finish uploading and send button becomes active
+    if (imageSession) {
+      try {
+        await imageSession.settle(true);
+      } catch (settleErr: any) {
+        await imageSession.abort().catch(() => {});
+        return {
+          text: "",
+          modelUsed,
+          reasoningUsed,
+          success: false,
+          error: `🛑 [Rasm yuklanishi tugamadi]: Gemini rasmni to'liq yuklab bo'lmadi: ${settleErr.message}`,
+        };
+      }
+    }
 
     // Click send
     const sendBtn = page
@@ -464,6 +502,11 @@ export class GeminiProvider {
     }
 
     await page.waitForTimeout(1000);
+
+    if (imageSession) {
+      await imageSession.verifySent().catch(() => {});
+      imageSession.dispose();
+    }
 
     // Immediate Write-Ahead URL Capture: As soon as URL transitions to /app/<id>, save immediately!
     for (let i = 0; i < 20; i++) {
