@@ -89,9 +89,13 @@ export function installConsultGate(pi: ExtensionAPI) {
     }
   };
 
-  // 1. Capture user input intent
+  // 1. Capture user input intent & self-heal halted gates on new user messages
   pi.on("input", async (event, ctx) => {
     const text = event.text ?? "";
+    if (text.startsWith("/")) return { action: "continue" };
+
+    const g = loadGate(ctx.cwd);
+
     if (TRIGGER.test(text)) {
       let provider = "AI";
       if (/chatgpt|gpt/i.test(text)) provider = "ChatGPT";
@@ -104,7 +108,25 @@ export function installConsultGate(pi: ExtensionAPI) {
         consults: 0,
         since: Date.now(),
       });
+      return { action: "continue" };
     }
+
+    // Self-healing: If gate was halted, a new message from the user heals it back to required
+    if (g.phase === "halted") {
+      saveGate(ctx.cwd, {
+        ...g,
+        phase: "required",
+        consults: 0,
+        reason: undefined,
+      });
+      if (ctx?.ui?.notify) {
+        ctx.ui.notify(
+          "ℹ️ [CONSULTATION GATE]: Yangi xabaringiz bilan Halt bekor qilindi (phase: required).",
+          "info",
+        );
+      }
+    }
+
     return { action: "continue" };
   });
 
@@ -141,34 +163,42 @@ export function installConsultGate(pi: ExtensionAPI) {
     };
   });
 
-  // 3. Track consultation results
+  // 3. Track consultation results using structured metadata
   pi.on("tool_result", async (event, ctx) => {
     if (!CONSULT_TOOL.test(event.toolName)) return;
 
     const g = loadGate(ctx.cwd);
     if (g.phase === "idle" || g.phase === "final") return;
 
-    if (event.isError) {
-      halt(ctx, g, `${event.toolName} asbobi xatolik qaytardi`);
+    const d = event.details && typeof event.details === "object" ? event.details : undefined;
+
+    // Structured failure checks
+    if (event.isError === true) {
+      halt(ctx, g, `${event.toolName} tool ijro xatosi berdi`);
+      return;
+    }
+    if (d?.success === false) {
+      halt(ctx, g, `${event.toolName} xatolik berdi: ${d.error ?? "noma'lum xatolik"}`);
       return;
     }
 
     const text = (event.content ?? []).map((c: any) => c.text ?? "").join("\n");
 
-    // Check for explicit error banners
-    if (/🛑\s*\[.*Xatosi\]/i.test(text) || /TypeError:|Error:/i.test(text)) {
-      halt(ctx, g, `${event.toolName} ichki xatolik berdi: ${text.slice(0, 100)}`);
+    // Check for explicit harness rejection banners ONLY at the start of output (never searching model body)
+    if (/^🛑\s*\[(REJECTED|.*XATOSI)\]/im.test(text.slice(0, 150))) {
+      halt(ctx, g, `${event.toolName} xatosi: ${text.slice(0, 120)}`);
       return;
     }
 
-    const s = parseConsultStatus(text);
+    // Check for FINAL state via structured details or anchored status text
+    const isStructuredFinal = d?.status === "FINAL" || d?.success === true && text.includes("STATUS: FINAL");
     const consults = g.consults + 1;
 
-    if (s?.state === "FINAL" && s.needs === 0) {
+    if (isStructuredFinal) {
       saveGate(ctx.cwd, { ...g, phase: "final", consults });
       if (ctx?.ui?.notify) {
         ctx.ui.notify(
-          `✅ [CONSULTATION GATE]: ${g.provider ?? "AI"} konsultatsiyasi yakunlandi. Endi kod tahrirlashga ruxsat berildi.`,
+          `✅ [CONSULTATION GATE]: ${g.provider ?? "AI"} konsultatsiyasi FINAL deb qabul qilindi. Kod tahrirlashga ruxsat berildi.`,
           "info",
         );
       }
@@ -193,6 +223,14 @@ export function installConsultGate(pi: ExtensionAPI) {
         `Gate: phase=${g.phase}, provider=${g.provider ?? "none"}, consults=${g.consults}, reason=${g.reason ?? "none"}`,
         "info",
       );
+    },
+  });
+
+  pi.registerCommand("consult-final", {
+    description: "Konsultatsiyani muvaffaqiyatli deb tasdiqlash va gate'ni final (ochiq) holatga o'tkazish",
+    handler: async (_args: string, ctx: any) => {
+      saveGate(ctx.cwd, { phase: "final", consults: 0, since: Date.now() });
+      ctx.ui.notify("Gate: final deb belgilandi (kod tahrirlashga ruxsat berildi)", "info");
     },
   });
 
