@@ -32,6 +32,7 @@ import { ChatStore, emptyLoop, isLoopOpen, type LoopState } from "./chat-store.j
 import { resolveImages, withAttachmentManifest } from "./image-attachments.js";
 import { acquireTabLease } from "./browser-tab-lease.js";
 import { checkEnglish } from "./language-guard.js";
+import { installConsultGate } from "./consult-gate.js";
 import {
   PROTOCOL_FOOTER,
   MAX_ROUNDS,
@@ -156,6 +157,9 @@ const CONSULT_MULTI_TURN_GUIDELINES = [
 ];
 
 export default function aiConsultExtension(pi: ExtensionAPI) {
+  // Install Fail-Closed Consultation Gate to physically block code modifications if consult was requested but bypassed or failed
+  installConsultGate(pi);
+
   const browserManager = new BrowserManager();
   let idleTimer: NodeJS.Timeout | null = null;
 
