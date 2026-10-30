@@ -600,10 +600,10 @@ Structure:
     const lastChat = await ChatStore.getLastChat(provider);
     const hasHealthyChat = !!lastChat?.chatUrl && (lastChat.turns ?? 0) < 30;
 
-    // Detect explicit user command for a new chat (Invariant I4)
+    // Detect explicit user command or caller directive for a new chat (Invariant I4)
     const userWantsNewChat =
-      params.newChatReason === "user_directive" ||
-      /\b(yangi\s+chat|yangi\s+suhbat|toza\s+chat|boshidan\s+boshla|new\s+chat|fresh\s+chat|start\s+new\s+chat|clean\s+chat|open\s+new\s+chat)\b/i.test(
+      Boolean(reasonLabel) ||
+      /\b(yangi\s+chat|yangi\s+suhbat|toza\s+chat|boshidan\s+boshla|new\s+chat|fresh\s+chat|start\s+new\s+chat|clean\s+chat|open\s+new\s+chat|topic_change)\b/i.test(
         params.prompt || "",
       );
 

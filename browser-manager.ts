@@ -103,43 +103,95 @@ export class BrowserManager {
   }
 
   private async closeNow(): Promise<void> {
-    try {
-      if (this.claudePage && !this.claudePage.isClosed()) {
-        await this.claudePage.close();
-      }
-    } catch {}
+    // 1. Collect and close all tracked pages across all scopes from the Maps
+    const allPages: Page[] = [];
+    for (const p of this.claudePages.values()) allPages.push(p);
+    for (const p of this.chatgptPages.values()) allPages.push(p);
+    for (const p of this.geminiPages.values()) allPages.push(p);
+
+    if (this.claudePage && !allPages.includes(this.claudePage)) allPages.push(this.claudePage);
+    if (this.chatgptPage && !allPages.includes(this.chatgptPage)) allPages.push(this.chatgptPage);
+    if (this.geminiPage && !allPages.includes(this.geminiPage)) allPages.push(this.geminiPage);
+
+    this.claudePages.clear();
+    this.chatgptPages.clear();
+    this.geminiPages.clear();
     this.claudePage = null;
-
-    try {
-      if (this.chatgptPage && !this.chatgptPage.isClosed()) {
-        await this.chatgptPage.close();
-      }
-    } catch {}
     this.chatgptPage = null;
-
-    try {
-      if (this.geminiPage && !this.geminiPage.isClosed()) {
-        await this.geminiPage.close();
-      }
-    } catch {}
     this.geminiPage = null;
 
-    // In CDP mode, close only the session's own pages and disconnect the client.
-    // Do NOT close the shared context or quit Chrome, allowing other Pi sessions to continue untouched!
-    if (this.mode !== "cdp") {
+    for (const page of allPages) {
+      try {
+        if (!page.isClosed()) {
+          await page.close({ runBeforeUnload: false });
+        }
+      } catch {}
+    }
+
+    // 2. Fallback sweep: Check CDP REST endpoints to close any lingering AI consultation tabs
+    if (this.mode === "cdp") {
+      try {
+        const res = await fetch(`http://127.0.0.1:${this.cdpPort}/json/list`, {
+          signal: AbortSignal.timeout(2000),
+        });
+        if (res.ok) {
+          const list = (await res.json()) as any[];
+          const aiTabs = list.filter(
+            (t) =>
+              t.type === "page" &&
+              /claude\.ai|chatgpt\.com|gemini\.google\.com/i.test(t.url || ""),
+          );
+          for (const tab of aiTabs) {
+            try {
+              await fetch(`http://127.0.0.1:${this.cdpPort}/json/close/${tab.id}`, {
+                signal: AbortSignal.timeout(2000),
+              });
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
+    // 3. Disconnect or close browser
+    if (this.mode === "cdp" && this.browser && this.browser.isConnected()) {
+      try {
+        const remainingPages = this.browser
+          .contexts()
+          .flatMap((c) => c.pages())
+          .filter((p) => !p.isClosed() && !p.url().includes("about:blank"));
+
+        if (remainingPages.length === 0) {
+          // No more active automation tabs across any session!
+          // Gracefully close the dedicated automation Chrome instance via browser-level CDP session
+          try {
+            const cdpSession = await this.browser.newBrowserCDPSession();
+            await cdpSession.send("Browser.close");
+          } catch {
+            await this.browser.close();
+          }
+        } else {
+          // Other sessions still have tabs open, just disconnect this client connection
+          await this.browser.close();
+        }
+      } catch {
+        try {
+          await this.browser.close();
+        } catch {}
+      }
+    } else if (this.mode !== "cdp") {
       try {
         if (this.context) {
           await this.context.close();
         }
       } catch {}
+      try {
+        if (this.browser) {
+          await this.browser.close();
+        }
+      } catch {}
     }
-    this.context = null;
 
-    try {
-      if (this.browser) {
-        await this.browser.close();
-      }
-    } catch {}
+    this.context = null;
     this.browser = null;
     this.mode = "disconnected";
   }
