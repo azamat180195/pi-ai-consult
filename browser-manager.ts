@@ -5,6 +5,7 @@ import { spawn, execSync } from "node:child_process";
 import net from "node:net";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { ChatStore } from "./chat-store.js";
+import { hasActiveOtherLeases } from "./browser-tab-lease.js";
 
 export interface BrowserStatus {
   mode: "cdp" | "persistent" | "disconnected";
@@ -102,25 +103,44 @@ export class BrowserManager {
     }
   }
 
-  private async closeNow(): Promise<void> {
-    // 1. Collect and close all tracked pages across all scopes from the Maps
-    const allPages: Page[] = [];
-    for (const p of this.claudePages.values()) allPages.push(p);
-    for (const p of this.chatgptPages.values()) allPages.push(p);
-    for (const p of this.geminiPages.values()) allPages.push(p);
+  private async closeNow(scopeKey?: string): Promise<void> {
+    const targetScope = scopeKey || ChatStore.getScope(process.cwd());
 
-    if (this.claudePage && !allPages.includes(this.claudePage)) allPages.push(this.claudePage);
-    if (this.chatgptPage && !allPages.includes(this.chatgptPage)) allPages.push(this.chatgptPage);
-    if (this.geminiPage && !allPages.includes(this.geminiPage)) allPages.push(this.geminiPage);
+    // 1. Collect and close ONLY this session's own tracked pages
+    const pagesToClose: Page[] = [];
 
-    this.claudePages.clear();
-    this.chatgptPages.clear();
-    this.geminiPages.clear();
-    this.claudePage = null;
-    this.chatgptPage = null;
-    this.geminiPage = null;
+    // If specific scopeKey is targeted, close only that scope's page; otherwise close this process's pages
+    if (this.claudePages.has(targetScope)) {
+      const p = this.claudePages.get(targetScope)!;
+      pagesToClose.push(p);
+      this.claudePages.delete(targetScope);
+    }
+    if (this.chatgptPages.has(targetScope)) {
+      const p = this.chatgptPages.get(targetScope)!;
+      pagesToClose.push(p);
+      this.chatgptPages.delete(targetScope);
+    }
+    if (this.geminiPages.has(targetScope)) {
+      const p = this.geminiPages.get(targetScope)!;
+      pagesToClose.push(p);
+      this.geminiPages.delete(targetScope);
+    }
 
-    for (const page of allPages) {
+    // Clean up any remaining pages tracked in this process
+    if (!scopeKey) {
+      for (const p of this.claudePages.values()) pagesToClose.push(p);
+      for (const p of this.chatgptPages.values()) pagesToClose.push(p);
+      for (const p of this.geminiPages.values()) pagesToClose.push(p);
+      this.claudePages.clear();
+      this.chatgptPages.clear();
+      this.geminiPages.clear();
+      this.claudePage = null;
+      this.chatgptPage = null;
+      this.geminiPage = null;
+    }
+
+    // Close only our own pages, NEVER touching another session's page!
+    for (const page of pagesToClose) {
       try {
         if (!page.isClosed()) {
           await page.close({ runBeforeUnload: false });
@@ -128,41 +148,21 @@ export class BrowserManager {
       } catch {}
     }
 
-    // 2. Fallback sweep: Check CDP REST endpoints to close any lingering AI consultation tabs
-    if (this.mode === "cdp") {
-      try {
-        const res = await fetch(`http://127.0.0.1:${this.cdpPort}/json/list`, {
-          signal: AbortSignal.timeout(2000),
-        });
-        if (res.ok) {
-          const list = (await res.json()) as any[];
-          const aiTabs = list.filter(
-            (t) =>
-              t.type === "page" &&
-              /claude\.ai|chatgpt\.com|gemini\.google\.com/i.test(t.url || ""),
-          );
-          for (const tab of aiTabs) {
-            try {
-              await fetch(`http://127.0.0.1:${this.cdpPort}/json/close/${tab.id}`, {
-                signal: AbortSignal.timeout(2000),
-              });
-            } catch {}
-          }
-        }
-      } catch {}
-    }
-
-    // 3. Disconnect or close browser
+    // 2. In CDP mode, safely evaluate whether other sessions or tabs are still active
     if (this.mode === "cdp" && this.browser && this.browser.isConnected()) {
       try {
-        const remainingPages = this.browser
+        // Check A: Does another Pi session have an active consultation lock?
+        const otherSessionsActive = hasActiveOtherLeases(targetScope);
+
+        // Check B: Are there other non-blank pages open in the browser belonging to other workspaces?
+        const otherPagesOpen = this.browser
           .contexts()
           .flatMap((c) => c.pages())
           .filter((p) => !p.isClosed() && !p.url().includes("about:blank"));
 
-        if (remainingPages.length === 0) {
-          // No more active automation tabs across any session!
-          // Gracefully close the dedicated automation Chrome instance via browser-level CDP session
+        if (!otherSessionsActive && otherPagesOpen.length === 0) {
+          // Zero active leases AND zero other tabs across all sessions:
+          // Safely terminate the dedicated automation Chrome instance via browser-level CDP session
           try {
             const cdpSession = await this.browser.newBrowserCDPSession();
             await cdpSession.send("Browser.close");
@@ -170,7 +170,8 @@ export class BrowserManager {
             await this.browser.close();
           }
         } else {
-          // Other sessions still have tabs open, just disconnect this client connection
+          // Another Pi session is active or has tabs open!
+          // ONLY disconnect this process's Playwright client connection, leaving the other session untouched!
           await this.browser.close();
         }
       } catch {

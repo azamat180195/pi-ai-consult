@@ -108,3 +108,36 @@ export async function drainTabIfBusy(page: Page, timeoutMs = 25_000): Promise<vo
     await page.waitForTimeout(500);
   }
 }
+
+/**
+ * Check if another Pi session has an active consultation lease lockfile.
+ */
+export function hasActiveOtherLeases(currentScopeKey: string): boolean {
+  try {
+    if (!fs.existsSync(LEASE_DIR)) return false;
+    const files = fs.readdirSync(LEASE_DIR);
+    const now = Date.now();
+    for (const file of files) {
+      if (!file.startsWith("lease-") || !file.endsWith(".lock")) continue;
+      // Format: lease-${provider}-${scopeKey}.lock
+      const raw = file.slice(6, -5);
+      const dashIdx = raw.indexOf("-");
+      if (dashIdx === -1) continue;
+      const scopeKey = raw.slice(dashIdx + 1);
+
+      if (scopeKey && scopeKey === currentScopeKey) {
+        continue; // Our own lease
+      }
+
+      const fullPath = path.join(LEASE_DIR, file);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (now - stat.mtimeMs < LEASE_TTL_MS) {
+          // Another session has an active, non-stale lease!
+          return true;
+        }
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
