@@ -180,23 +180,25 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
   // 2. NEEDS_FOLLOWUP (active loop): Bounded 5-minute watchdog TTL so abandoned loops never leak eternal windows.
   pi.on("agent_end", async (_e, ctx) => {
     try {
-      const openLoops = await Promise.all(
-        (["claude", "chatgpt", "gemini"] as const).map(async (p) => ({
-          p,
-          loop: await ChatStore.getLoop(p),
-        })),
-      );
-      const active = openLoops.filter((x) => isLoopOpen(x.loop));
-      if (active.length > 0) {
-        if (ctx?.ui?.notify) {
-          ctx.ui.notify(
-            `⚠️ ai-consult: Faol maslahatlashuv davom etmoqda (${active.map((a) => a.p).join(", ")}) — brauzer 5 daqiqalik xavfsizlik kutishida.`,
-            "warning",
-          );
+      if (browserManager.inFlight > 0) {
+        const openLoops = await Promise.all(
+          (["claude", "chatgpt", "gemini"] as const).map(async (p) => ({
+            p,
+            loop: await ChatStore.getLoop(p),
+          })),
+        );
+        const active = openLoops.filter((x) => isLoopOpen(x.loop));
+        if (active.length > 0) {
+          if (ctx?.ui?.notify) {
+            ctx.ui.notify(
+              `⚠️ ai-consult: Faol maslahatlashuv davom etmoqda (${active.map((a) => a.p).join(", ")}) — brauzer 5 daqiqalik xavfsizlik kutishida.`,
+              "warning",
+            );
+          }
+          // Bounded 5-minute watchdog TTL for open multi-turn loops (never eternal)
+          resetIdleAutoClose(5 * 60 * 1000);
+          return;
         }
-        // Bounded 5-minute watchdog TTL for open multi-turn loops (never eternal)
-        resetIdleAutoClose(5 * 60 * 1000);
-        return;
       }
     } catch {}
 
@@ -685,7 +687,12 @@ Structure:
     }
 
     const finalPrompt = withAttachmentManifest(safePrompt, resolved.images);
-    const scopeKey = ChatStore.getScopeKey(process.cwd());
+    const scopeKey =
+      typeof ChatStore.getScope === "function"
+        ? ChatStore.getScope(process.cwd())
+        : typeof (ChatStore as any).getScopeKey === "function"
+        ? (ChatStore as any).getScopeKey(process.cwd())
+        : ChatStore.getProjectLabel();
     const lease = await acquireTabLease(provider, scopeKey);
 
     cancelIdleAutoClose();

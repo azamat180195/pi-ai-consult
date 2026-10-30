@@ -21,6 +21,7 @@ export interface LoopState {
   pending: InfoNeed[];
   lastNeedsKey: string;
   nudges: number;
+  updatedAt?: number;
 }
 
 export const emptyLoop = (): LoopState => ({
@@ -32,7 +33,7 @@ export const emptyLoop = (): LoopState => ({
 });
 
 export const isLoopOpen = (l?: LoopState): boolean =>
-  !!l && l.state !== "FINAL" && l.round > 0;
+  !!l && l.state !== "FINAL" && l.round > 0 && (!l.updatedAt || Date.now() - l.updatedAt < 15 * 60 * 1000);
 
 export interface ChatSessionInfo {
   chatUrl: string;
@@ -231,6 +232,10 @@ export class ChatStore {
     return getScopeKey(cwd);
   }
 
+  public static getScopeKey(cwd = process.cwd()): string {
+    return getScopeKey(cwd);
+  }
+
   public static getProjectLabel(cwd = process.cwd()): string {
     return getProjectLabel(cwd);
   }
@@ -403,7 +408,7 @@ export class ChatStore {
     const scope = getScopeKey(cwd);
     await mutate((d) => {
       const r = getRec(d, scope, provider);
-      r.loop = loop;
+      r.loop = { ...loop, updatedAt: Date.now() };
     });
   }
 
