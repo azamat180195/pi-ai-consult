@@ -95,11 +95,56 @@ export class BrowserManager {
   }
 
   public async close(force = false): Promise<void> {
-    if (force) {
-      this.cancelClose();
-      await this.closeNow();
-    } else {
-      this.scheduleClose(0);
+    this.cancelClose();
+    await this.closeNow();
+  }
+
+  public async closeTab(
+    provider: "claude" | "chatgpt" | "gemini",
+    scopeKey: string,
+  ): Promise<void> {
+    let page: Page | undefined;
+    if (provider === "claude") {
+      page = this.claudePages.get(scopeKey);
+      this.claudePages.delete(scopeKey);
+    } else if (provider === "chatgpt") {
+      page = this.chatgptPages.get(scopeKey);
+      this.chatgptPages.delete(scopeKey);
+    } else if (provider === "gemini") {
+      page = this.geminiPages.get(scopeKey);
+      this.geminiPages.delete(scopeKey);
+    }
+
+    if (page && !page.isClosed()) {
+      try {
+        await page.close({ runBeforeUnload: false });
+      } catch {}
+    }
+
+    await this.closeNowIfDrained(scopeKey);
+  }
+
+  private async closeNowIfDrained(targetScope: string): Promise<void> {
+    if (this.mode === "cdp" && this.browser && this.browser.isConnected()) {
+      try {
+        const otherSessionsActive = hasActiveOtherLeases(targetScope);
+        const otherPagesOpen = this.browser
+          .contexts()
+          .flatMap((c) => c.pages())
+          .filter((p) => !p.isClosed() && !p.url().includes("about:blank"));
+
+        if (!otherSessionsActive && otherPagesOpen.length === 0) {
+          try {
+            const cdpSession = await this.browser.newBrowserCDPSession();
+            await cdpSession.send("Browser.close");
+          } catch {
+            await this.browser.close();
+          }
+          this.context = null;
+          this.browser = null;
+          this.mode = "disconnected";
+        }
+      } catch {}
     }
   }
 

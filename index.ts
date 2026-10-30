@@ -206,8 +206,8 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
       }
     } catch {}
 
-    // When consultation is FINAL or idle, close within 25 seconds
-    resetIdleAutoClose(25 * 1000);
+    // When consultation is FINAL or idle, close promptly within 3 seconds (no more 25-second ghost tabs!)
+    resetIdleAutoClose(3000);
   });
 
   // Clean up on session shutdown
@@ -760,6 +760,14 @@ Structure:
         const stuck = params.intent === "evidence" && parsed.state === "NEED_INFO" && needsKey && needsKey === loop.lastNeedsKey;
 
         const isFinal = parsed.state === "FINAL";
+        if (isFinal) {
+          // Rapid tab closure on FINAL state: close this provider's tab promptly after 2s grace
+          setTimeout(async () => {
+            try {
+              await browserManager.closeTab(provider, scopeKey);
+            } catch {}
+          }, 2000);
+        }
         const nextLoop: LoopState = {
           round: isFinal ? 0 : (isNewQuestion ? 1 : loop.round + 1),
           state: parsed.state,
