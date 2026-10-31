@@ -407,25 +407,6 @@ export class ChatGPTProvider {
 
     const inputLocator = page.locator(`[${COMPOSER_ATTR}="1"]`).first();
 
-    // 3.5 Attach Images if provided
-    const imgs = options.images ?? [];
-    let imageSession: ImageAttachSession | undefined;
-    if (imgs.length > 0) {
-      try {
-        imageSession = new ImageAttachSession(page, "chatgpt", inputLocator, imgs);
-        await imageSession.attach();
-      } catch (attachErr: any) {
-        await imageSession?.abort().catch(() => {});
-        return {
-          success: false,
-          text: "",
-          error: `🛑 [Rasm yuklashda xatolik]: ChatGPT ga rasm biriktirish amalga oshmadi: ${attachErr.message}`,
-        };
-      }
-    }
-
-    // 4. Input Prompt (clean any drafts, use synthetic paste for reliable ProseMirror state)
-    // Wait up to 15s for any in-flight stream/stop button to settle before sending
     // Pre-Submission Barrier: Ensure any previous turn (thinking, web searching, or streaming)
     // has completely finished before typing a new prompt. Wait up to 120s to prevent overlapping collisions!
     const idleWaitStart = Date.now();
@@ -466,11 +447,29 @@ export class ChatGPTProvider {
       await inputLocator.evaluate((el) => (el as HTMLElement).focus());
     }
 
+    // Clean any prior composer drafts BEFORE attaching any files!
     await page.keyboard.press("ControlOrMeta+a");
     await page.keyboard.press("Backspace");
     await page.waitForTimeout(200);
 
-    // Synthetic paste event ensures ProseMirror state updates and Send button enables
+    // 3.5 Attach Images AFTER composer cleanup (never clear composer after files are attached!)
+    const imgs = options.images ?? [];
+    let imageSession: ImageAttachSession | undefined;
+    if (imgs.length > 0) {
+      try {
+        imageSession = new ImageAttachSession(page, "chatgpt", inputLocator, imgs);
+        await imageSession.attach();
+      } catch (attachErr: any) {
+        await imageSession?.abort().catch(() => {});
+        return {
+          success: false,
+          text: "",
+          error: `🛑 [Rasm yuklashda xatolik]: ChatGPT ga rasm biriktirish amalga oshmadi: ${attachErr.message}`,
+        };
+      }
+    }
+
+    // 4. Input Prompt (paste text, NO Ctrl+A)
     await inputLocator.evaluate((el, text) => {
       (el as HTMLElement).focus();
       const dt = new DataTransfer();

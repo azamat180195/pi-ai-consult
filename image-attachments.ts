@@ -94,14 +94,64 @@ function cleanRaw(raw: string): string {
   return s;
 }
 
-async function firstExistingFile(raw: string, cwd: string, extra: string[]): Promise<string | null> {
-  const s = cleanRaw(raw);
-  const cands = path.isAbsolute(s) ? [s] : [cwd, os.tmpdir(), ...extra].map((r) => path.resolve(r, s));
-  for (const c of cands) {
-    try {
-      if ((await fs.stat(c)).isFile()) return await fs.realpath(c);
-    } catch { /* next */ }
+async function childDirs(root: string, cap = 100): Promise<string[]> {
+  try {
+    const ents = await fs.readdir(root, { withFileTypes: true });
+    return ents
+      .filter((e) => e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules")
+      .slice(0, cap)
+      .map((e) => path.join(root, e.name));
+  } catch {
+    return [];
   }
+}
+
+async function firstExistingFile(raw: string, cwd: string, extra: string[] = []): Promise<string | null> {
+  const s = cleanRaw(raw);
+  if (path.isAbsolute(s)) {
+    try {
+      if ((await fs.stat(s)).isFile()) return await fs.realpath(s);
+    } catch {}
+    return null;
+  }
+
+  const home = os.homedir();
+  const parentOfCwd = path.dirname(path.resolve(cwd));
+  const desktop = path.join(home, "Desktop");
+  const downloads = path.join(home, "Downloads");
+  const tmp = os.tmpdir();
+  const processTemp = process.env.TEMP || process.env.TMP;
+
+  // Tier 1: Search directly in cwd, parent directory, Desktop, Downloads, and temp folders
+  const primaryRoots = [
+    cwd,
+    parentOfCwd,
+    desktop,
+    downloads,
+    tmp,
+    processTemp,
+    ...extra,
+  ].filter(Boolean) as string[];
+
+  for (const r of primaryRoots) {
+    try {
+      const c = path.resolve(r, s);
+      if ((await fs.stat(c)).isFile()) return await fs.realpath(c);
+    } catch {}
+  }
+
+  // Tier 2: Search immediate subfolders (depth 1) of Desktop and parentOfCwd (e.g. Desktop/Ahmad Ibn Hambal/1.jpg)
+  const wideRoots = [parentOfCwd, desktop];
+  for (const root of wideRoots) {
+    const kids = await childDirs(root);
+    for (const kid of kids) {
+      try {
+        const c = path.resolve(kid, s);
+        if ((await fs.stat(c)).isFile()) return await fs.realpath(c);
+      } catch {}
+    }
+  }
+
   return null;
 }
 
@@ -118,7 +168,20 @@ async function readHead(p: string, n = 16): Promise<Buffer> {
 export async function resolveImages(o: ResolveOpts): Promise<ResolveResult> {
   const lim = { ...IMAGE_LIMITS, ...o.limits };
   const res: ResolveResult = { images: [], errors: [], warnings: [], skipped: [], missingMentions: [] };
-  const roots = [o.cwd, os.tmpdir(), ...(o.extraRoots ?? [])];
+  const home = os.homedir();
+  const parentOfCwd = path.dirname(path.resolve(o.cwd));
+  const desktop = path.join(home, "Desktop");
+  const downloads = path.join(home, "Downloads");
+  const roots = [
+    o.cwd,
+    parentOfCwd,
+    desktop,
+    downloads,
+    os.tmpdir(),
+    process.env.TEMP,
+    process.env.TMP,
+    ...(o.extraRoots ?? []),
+  ].filter(Boolean) as string[];
   const explicit = (o.explicit ?? []).filter((s) => typeof s === "string" && s.trim());
   const useExplicit = explicit.length > 0;
   const raws = useExplicit ? explicit : o.autoAttach === false ? [] : extractImageMentions(o.prompt);

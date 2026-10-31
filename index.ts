@@ -684,6 +684,23 @@ Structure:
       };
     }
 
+    if (resolved.missingMentions.length > 0 && resolved.images.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `🛑 [Rasm Topilmadi]: So'rovda ko'rsatilgan (${resolved.missingMentions.join(", ")}) fayllari diskda topilmadi! Rasm biriktirilmasa, tashqi AI ko'r-ko'rona noto'g'ri maslahat berishi mumkin. Iltimos, rasmlarning to'liq yo'lini ko'rsating yoki ularni loyiha jildiga / Desktopga joylashtiring.`,
+          },
+        ],
+        details: {
+          success: false,
+          error: `Missing images: ${resolved.missingMentions.join(", ")}`,
+          isValidation: true,
+          consultKind: "validation_rejected",
+        },
+      };
+    }
+
     for (const w of resolved.warnings) ctx?.ui?.notify?.(w, "warning");
     for (const s of resolved.skipped) ctx?.ui?.notify?.(`rasm o'tkazib yuborildi: ${s}`, "warning");
 
