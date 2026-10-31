@@ -1,375 +1,405 @@
-import { promises as fs } from "node:fs";
+// image-upload.ts
+// Robust multimodal file upload session supporting modern ChatGPT, Claude, and Gemini web interfaces.
+// Features document-wide file input discovery, plus-button menu chooser, synthetic blob drop/paste, and composer-scoped tile verification.
+
+import { readFile } from "node:fs/promises";
+import { basename, extname } from "node:path";
 import type { Page, Locator } from "playwright-core";
 import type { ImageFile, ProviderId } from "./image-attachments.js";
 
-const ROOT_ATTR = "data-aic-root";
-const INPUT_ATTR = "data-aic-fileinput";
+const MIME_BY_EXT: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+const IN_ATTR = "data-ac-file-input";
+const PLUS_ATTR = "data-ac-plus";
+const RM_ATTR = "data-ac-rm";
+
+const UPLOAD_MENU_RE =
+  /upload|add (photos|files)|from (computer|device)|photos? (&|and) files|загруз|прикреп|yuklash|biriktir/i;
+const ERR_RE =
+  /limit|too many|unsupported|failed|error|couldn.?t|can.?t|exceed|превыш|ошибк|xato/i;
+
+export interface FilePayload {
+  name: string;
+  mimeType: string;
+  buffer: Buffer;
+}
+
+export interface ComposerState {
+  composer: boolean;
+  count: number;
+  busy: boolean;
+  alert: string;
+}
 
 export class AttachmentError extends Error {
-  constructor(public phase: string, msg: string) {
+  constructor(public phase: string, msg: string, public diag?: unknown) {
     super(`[image-attach:${phase}] ${msg}`);
     this.name = "AttachmentError";
   }
 }
 
-interface UploadProfile {
-  attachBtnRe: RegExp;
-  menuItemRe: RegExp;
-  removeBtnRe: RegExp;
-  sendSel: string;
-}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const COMMON_SEND =
-  '[data-testid="send-button"], button[aria-label*="Send" i], button[aria-label*="Отправ" i], button[aria-label*="Yubor" i], button.send-button';
+/**
+ * In-page DOM inspector to locate composer, inspect state, and tag input/button elements.
+ */
+function pageOp(page: Page, op: "state" | "tagInput" | "tagPlus" | "tagRemove" | "diag"): Promise<any> {
+  return page.evaluate(
+    ([op, IN, PL, RM]) => {
+      const ta = document.querySelector<HTMLElement>(
+        '#prompt-textarea, [data-testid="prompt-textarea"], .ProseMirror[contenteditable="true"], rich-textarea, .ql-editor',
+      );
+      const inHistory = (e: Element) => !!e.closest("[data-message-author-role], article, model-response, user-query");
+      const visible = (e: Element) => (e as HTMLElement).getClientRects().length > 0;
 
-const PROFILES: Record<ProviderId, UploadProfile> = {
-  chatgpt: {
-    attachBtnRe: /add (photos|files)|attach|upload|прикреп|добав|загруз|biriktir|yuklash/i,
-    menuItemRe: /(add|upload).{0,20}(photo|file)|photos? (&|and) files|загруз|добавить.{0,20}(фото|файл)|fayl|rasm/i,
-    removeBtnRe: /remove|delete|удал|убрать|o['’]chir|olib/i,
-    sendSel: COMMON_SEND,
-  },
-  claude: {
-    attachBtnRe: /attach|upload|add (files|content)|прикреп|загруз|добав|biriktir|yuklash/i,
-    menuItemRe: /upload.{0,20}(file|photo)|add.{0,20}(file|photo)|загруз|добавить.{0,20}(файл|фото)|fayl|rasm/i,
-    removeBtnRe: /remove|delete|удал|убрать|o['’]chir|olib/i,
-    sendSel: COMMON_SEND,
-  },
-  gemini: {
-    attachBtnRe: /upload|open upload|attach|add|загруз|прикреп|добав|yuklash|biriktir/i,
-    menuItemRe: /upload.{0,10}file|files?$|загрузить.{0,10}файл|файлы|fayllarni|fayl/i,
-    removeBtnRe: /remove|delete|удал|убрать|o['’]chir|olib/i,
-    sendSel: COMMON_SEND,
-  },
-};
-
-const TURNS_SEL =
-  '[data-turn-key], [data-content-search-turn-key], article, [data-message-author-role], user-query, model-response, [data-testid^="conversation-turn"]';
-const ERR_RE =
-  "(upload|file|image|attach|photo).{0,60}(fail|error|unsupported|too large|couldn|can'?t|not supported|exceed)|не удалось|ошибк|слишком|не поддерж|xatolik|yuklab bo['’]?lmadi";
-
-class UploadNetworkGate {
-  private inflight = new Set<unknown>();
-  failure: string | null = null;
-  private re = /upload|\/files?(\/|\?|$)|attachment|blob\.core\.windows|push\.clients6|googleusercontent/i;
-  private onReq = (r: any) => {
-    if (/^(POST|PUT|PATCH)$/.test(r.method()) && this.re.test(r.url())) {
-      this.inflight.add(r);
-    }
-  };
-  private onFin = (r: any) => {
-    this.inflight.delete(r);
-  };
-  private onResp = (r: any) => {
-    const req = r.request();
-    if (this.re.test(req.url()) && /^(POST|PUT|PATCH)$/.test(req.method()) && r.status() >= 400) {
-      this.failure = `HTTP ${r.status()} on upload request`;
-    }
-  };
-
-  constructor(private page: Page) {
-    page.on("request", this.onReq);
-    page.on("requestfinished", this.onFin);
-    page.on("requestfailed", this.onFin);
-    page.on("response", this.onResp);
-  }
-
-  get pending() {
-    return this.inflight.size;
-  }
-
-  dispose() {
-    this.page.off("request", this.onReq);
-    this.page.off("requestfinished", this.onFin);
-    this.page.off("requestfailed", this.onFin);
-    this.page.off("response", this.onResp);
-  }
-}
-
-async function tagRoot(composer: Locator) {
-  await composer.evaluate((el, a) => {
-    document.querySelectorAll(`[${a.attr}]`).forEach((n) => n.removeAttribute(a.attr));
-    let best: Element = el.closest("form") ?? el.parentElement ?? el;
-    for (let i = 0; i < 6; i++) {
-      const p = best.parentElement;
-      if (!p || p === document.body || p.tagName === "MAIN" || p.querySelector(a.turns)) break;
-      best = p;
-    }
-    best.setAttribute(a.attr, "1");
-  }, { attr: ROOT_ATTR, turns: TURNS_SEL });
-}
-
-interface UploadState {
-  tiles: number;
-  imgsLoaded: boolean;
-  spinners: number;
-  error: string | null;
-  sendEnabled: boolean | null;
-}
-
-async function readState(page: Page, p: UploadProfile): Promise<UploadState> {
-  return page.evaluate((a) => {
-    const root = document.querySelector(`[${a.rootAttr}="1"]`);
-    if (!root) return { tiles: 0, imgsLoaded: true, spinners: 0, error: "root-missing", sendEnabled: null };
-    const vis = (e: Element) => {
-      const r = e.getBoundingClientRect();
-      const cs = getComputedStyle(e);
-      return r.width > 0 && r.height > 0 && cs.visibility !== "hidden" && cs.display !== "none";
-    };
-    const inEditor = (e: Element) => !!e.closest('[contenteditable="true"]');
-    const imgs = Array.from(root.querySelectorAll("img")).filter((i) => {
-      const r = i.getBoundingClientRect();
-      return r.width >= 24 && r.height >= 24 && !inEditor(i);
-    });
-    const rmRe = new RegExp(a.rmRe, "i");
-    const removes = Array.from(root.querySelectorAll('button,[role="button"]')).filter(
-      (b) => vis(b) && rmRe.test(`${b.getAttribute("aria-label") ?? ""} ${b.getAttribute("title") ?? ""}`),
-    );
-    const spinners = Array.from(root.querySelectorAll(
-      '[role="progressbar"],progress,[aria-busy="true"],mat-spinner,svg.animate-spin,[class*="spinner" i],[class*="loading" i]',
-    )).filter((e) => vis(e) && !inEditor(e)).length;
-    const errRe = new RegExp(a.errRe, "i");
-    const errEls = [
-      ...Array.from(root.querySelectorAll('[role="alert"],[class*="error" i],[class*="fail" i],[data-state="error"]')),
-      ...Array.from(document.querySelectorAll('[role="alert"],[role="status"],[class*="toast" i]')),
-    ].filter((e) => vis(e) && !inEditor(e));
-    let error: string | null = null;
-    for (const e of errEls) {
-      const t = (e.textContent ?? "").trim();
-      if (t && t.length < 300 && errRe.test(t)) {
-        error = t.slice(0, 160);
-        break;
-      }
-    }
-    const send = root.querySelector<HTMLButtonElement>(a.sendSel);
-    const sendEnabled = send ? !send.disabled && send.getAttribute("aria-disabled") !== "true" : null;
-    return {
-      tiles: Math.max(imgs.length, removes.length),
-      imgsLoaded: imgs.every((i) => i.complete && i.naturalWidth > 0),
-      spinners,
-      error,
-      sendEnabled,
-    };
-  }, { rootAttr: ROOT_ATTR, rmRe: p.removeBtnRe.source, errRe: ERR_RE, sendSel: p.sendSel });
-}
-
-async function tagFileInput(page: Page): Promise<{ found: boolean; multiple: boolean }> {
-  return page.evaluate((a) => {
-    document.querySelectorAll(`[${a.inAttr}]`).forEach((n) => n.removeAttribute(a.inAttr));
-    const root = document.querySelector(`[${a.rootAttr}="1"]`);
-    if (!root) return { found: false, multiple: false };
-    const scopes: Element[] = [root];
-    let p = root.parentElement;
-    for (let i = 0; i < 2 && p && !p.querySelector(a.turns); i++) {
-      scopes.push(p);
-      p = p.parentElement;
-    }
-    const seen = new Set<Element>();
-    const cands: HTMLInputElement[] = [];
-    for (const s of scopes) {
-      s.querySelectorAll<HTMLInputElement>('input[type="file"]').forEach((i) => {
-        if (!seen.has(i)) {
-          seen.add(i);
-          cands.push(i);
+      let root: Element | null = ta ? ta.closest("form") : null;
+      if (!root && ta) {
+        root = ta;
+        for (
+          let i = 0;
+          i < 6 && root.parentElement && !root.parentElement.querySelector("[data-message-author-role]");
+          i++
+        ) {
+          root = root.parentElement;
         }
-      });
-    }
-    const ok = (i: HTMLInputElement) => {
-      const acc = (i.accept || "").toLowerCase();
-      return !acc || acc.includes("image") || acc.includes("*/*") || /\.(png|jpe?g|webp)/.test(acc);
-    };
-    const good = cands.filter(ok).sort((x, y) => Number(y.multiple) - Number(x.multiple));
-    if (!good.length) return { found: false, multiple: false };
-    good[0].setAttribute(a.inAttr, "1");
-    return { found: true, multiple: good[0].multiple };
-  }, { rootAttr: ROOT_ATTR, inAttr: INPUT_ATTR, turns: TURNS_SEL });
+      }
+
+      const q = (s: string) =>
+        root ? Array.from(root.querySelectorAll<HTMLElement>(s)).filter((e) => !inHistory(e) && visible(e)) : [];
+
+      const RM_SEL =
+        'button[aria-label*="remove" i], button[aria-label*="удалить" i], button[aria-label*="olib" i], [data-testid*="remove" i], [data-testid*="attachment-remove" i]';
+
+      const alertText = () =>
+        Array.from(
+          document.querySelectorAll(
+            '[role="alert"], [data-sonner-toast], [data-testid*="toast" i], [role="status"]',
+          ),
+        )
+          .map((e) => (e.textContent || "").trim())
+          .filter(Boolean)
+          .join(" | ")
+          .slice(0, 300);
+
+      if (op === "state") {
+        const rm = q(RM_SEL).length;
+        const blobs = q('img[src^="blob:"], img[src*="oaiusercontent" i], img[src*="/files/" i]').length;
+        const chips = q(
+          '[data-testid*="attachment" i], [data-testid*="file-tile" i], div[class*="attachment" i], div[class*="image-preview" i]',
+        ).length;
+        const busy =
+          q(
+            '[role="progressbar"], [aria-busy="true"], [data-testid*="uploading" i], [data-testid*="spinner" i]',
+          ).length > 0;
+
+        return {
+          composer: !!root,
+          count: Math.max(rm, blobs, chips),
+          busy,
+          alert: alertText(),
+        };
+      }
+
+      if (op === "tagInput") {
+        document.querySelectorAll(`[${IN}]`).forEach((e) => e.removeAttribute(IN));
+        // Search document-wide (file inputs frequently live outside the form in React portals)
+        const all = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).filter(
+          (i) => !i.disabled && !i.webkitdirectory,
+        );
+        if (!all.length) return { found: false, total: 0 };
+
+        const score = (i: HTMLInputElement) => {
+          const a = (i.accept || "").toLowerCase();
+          let s = 0;
+          if (!a) s += 2;
+          if (/image|jpe?g|png|\*/.test(a)) s += 4;
+          if (i.multiple) s += 2;
+          if (i.closest("form")) s += 2;
+          if (i.hasAttribute("capture") || /camera/i.test(i.id)) s -= 5;
+          return s;
+        };
+
+        all.sort((a, b) => score(b) - score(a));
+        all[0].setAttribute(IN, "1");
+        return { found: true, total: all.length, multiple: all[0].multiple };
+      }
+
+      if (op === "tagPlus") {
+        document.querySelectorAll(`[${PL}]`).forEach((e) => e.removeAttribute(PL));
+        const sels = [
+          '[data-testid="composer-plus-btn"]',
+          'button[data-testid*="attach" i]',
+          'button[aria-label*="attach" i]',
+          'button[aria-label*="add files" i]',
+          'button[aria-label*="add photos" i]',
+          'button[aria-label*="upload" i]',
+          'button[aria-label*="add content" i]',
+          'button[aria-label*="прикреп" i]',
+          'button[aria-haspopup="menu"]',
+        ];
+
+        let hit: HTMLElement | undefined;
+        for (const s of sels) {
+          hit = q(s)[0];
+          if (hit) break;
+        }
+
+        if (!hit) {
+          // Structural fallback: leftmost button with an icon in composer
+          const bad = /send|voice|speech|mic|dictat|stop|submit/i;
+          hit = q("button")
+            .filter(
+              (b) =>
+                !(b.textContent || "").trim() &&
+                !bad.test((b.getAttribute("aria-label") || "") + (b.getAttribute("data-testid") || "")) &&
+                !!b.querySelector("svg"),
+            )
+            .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0];
+        }
+
+        if (!hit) return false;
+        hit.setAttribute(PL, "1");
+        return true;
+      }
+
+      if (op === "tagRemove") {
+        document.querySelectorAll(`[${RM}]`).forEach((e) => e.removeAttribute(RM));
+        const b = q(RM_SEL)[0];
+        if (!b) return false;
+        b.setAttribute(RM, "1");
+        return true;
+      }
+
+      // Diagnostic dump on failure
+      return {
+        url: location.href,
+        composer: !!root,
+        inputs: Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).map((i) => ({
+          id: i.id,
+          accept: i.accept,
+          multiple: i.multiple,
+          inForm: !!i.closest("form"),
+          parent: i.parentElement?.tagName,
+        })),
+        buttons: q("button").map((b) => ({
+          aria: b.getAttribute("aria-label"),
+          tid: b.getAttribute("data-testid"),
+          text: (b.textContent || "").trim().slice(0, 30),
+        })),
+        alert: alertText(),
+      };
+    },
+    [op, IN_ATTR, PLUS_ATTR, RM_ATTR] as const,
+  );
 }
 
 export class ImageAttachSession {
-  private net: UploadNetworkGate;
-  private profile: UploadProfile;
-  private baseline = 0;
+  private files: FilePayload[] = [];
+  private disposed = false;
 
   constructor(
     private page: Page,
-    provider: ProviderId,
-    private composer: Locator,
-    private files: ImageFile[],
-    private log: (m: string) => void = () => {},
+    private provider: ProviderId = "chatgpt",
+    private composer?: Locator,
+    images: (ImageFile | string)[] = [],
+    private log: (m: string) => void = (m) => console.error(m),
   ) {
-    this.profile = PROFILES[provider];
-    this.net = new UploadNetworkGate(page);
+    this.initFiles(images);
   }
 
-  private async payloads(subset: ImageFile[] = this.files) {
-    return Promise.all(
-      subset.map(async (f) => ({
-        name: f.name,
-        mimeType: f.mime,
-        buffer: await fs.readFile(f.absPath),
-      })),
+  private async initFiles(images: (ImageFile | string)[]) {
+    this.files = await Promise.all(
+      images.map(async (img) => {
+        const absPath = typeof img === "string" ? img : img.absPath;
+        const name = typeof img === "string" ? basename(absPath) : img.name;
+        const ext = extname(absPath).toLowerCase();
+        const mimeType = typeof img === "string" ? MIME_BY_EXT[ext] || "image/jpeg" : img.mime;
+        const buffer = await readFile(absPath);
+        return { name, mimeType, buffer };
+      }),
     );
   }
 
-  private async clearTiles(max = 10) {
-    const root = this.page.locator(`[${ROOT_ATTR}="1"]`);
-    for (let i = 0; i < max; i++) {
-      const btn = root.getByRole("button", { name: this.profile.removeBtnRe }).first();
-      if (!(await btn.isVisible().catch(() => false))) break;
-      await btn.click({ timeout: 2000 }).catch(() => {});
-      await this.page.waitForTimeout(200);
-    }
-  }
+  async attach(): Promise<"input" | "chooser" | "drop" | "paste"> {
+    if (!this.files.length) return "input";
 
-  async attach(): Promise<"input" | "chooser" | "paste"> {
-    await tagRoot(this.composer);
-    let st = await readState(this.page, this.profile);
-    if (st.tiles > 0) {
-      await this.clearTiles();
-      st = await readState(this.page, this.profile);
-    }
-    this.baseline = st.tiles;
+    await this.clearStale();
+    const targetCount = this.files.length;
 
-    const methods: Array<["input" | "chooser" | "paste", () => Promise<boolean>]> = [
+    const tiers: [string, () => Promise<void>][] = [
       ["input", () => this.viaInput()],
       ["chooser", () => this.viaChooser()],
-      ["paste", () => this.viaPaste()],
+      ["drop", () => this.viaDrop("drop")],
+      ["paste", () => this.viaDrop("paste")],
     ];
 
-    for (const [name, fn] of methods) {
-      let used = false;
+    const errs: string[] = [];
+    for (const [name, run] of tiers) {
       try {
-        used = await fn();
-      } catch (e) {
-        this.log(`${name} failed: ${(e as Error).message}`);
+        await run();
+      } catch (e: any) {
+        errs.push(`${name}: ${e.message}`);
+        continue;
       }
-      if (!used) continue;
-      try {
-        await this.settle(false, 12_000 + 8_000 * this.files.length, this.files.length);
-        return name;
-      } catch (e) {
-        const cur = await readState(this.page, this.profile);
-        if (cur.tiles > this.baseline) throw e;
-        this.log(`${name}: no tile appeared; trying next tier`);
+
+      const timeoutMs = name === "input" || name === "chooser" ? 18000 : 12000;
+      const res = await this.waitForSettled(targetCount, timeoutMs);
+
+      if (res.ok) {
+        this.log(`[image-attach] attached successfully via ${name}`);
+        return name as any;
       }
+
+      if (res.s.count >= targetCount || res.toast) {
+        const diag = await pageOp(this.page, "diag");
+        throw new AttachmentError(
+          "attach",
+          `via ${name}: ${res.toast ? "error toast" : "tile appeared but upload did not settle"}: ${res.s.alert || "busy=" + res.s.busy}`,
+          diag,
+        );
+      }
+
+      errs.push(`${name}: no tile appeared`);
     }
-    await this.abort();
-    throw new AttachmentError("attach", "no upload method produced attachment tiles");
+
+    const diag = await pageOp(this.page, "diag");
+    throw new AttachmentError("attach", `no upload method produced attachment tiles :: ${errs.join(" | ")}`, diag);
   }
 
-  private async viaInput(): Promise<boolean> {
-    const { found, multiple } = await tagFileInput(this.page);
-    if (!found) return false;
-    const input = this.page.locator(`[${INPUT_ATTR}="1"]`);
-    if (multiple) {
-      await input.setInputFiles(await this.payloads(), { timeout: 10_000 });
-      return true;
+  private async clearStale() {
+    for (let i = 0; i < 6 && (await pageOp(this.page, "tagRemove")); i++) {
+      await this.page.locator(`[${RM_ATTR}="1"]`).first().click({ timeout: 2000 }).catch(() => {});
+      await sleep(300);
     }
-    for (let i = 0; i < this.files.length; i++) {
-      await this.page.locator(`[${INPUT_ATTR}="1"]`).setInputFiles(await this.payloads([this.files[i]]), { timeout: 10_000 });
-      await this.settle(false, 20_000, i + 1);
-      await tagFileInput(this.page);
-    }
-    return true;
   }
 
-  private async viaChooser(): Promise<boolean> {
-    const root = this.page.locator(`[${ROOT_ATTR}="1"]`);
-    const btns = root.getByRole("button", { name: this.profile.attachBtnRe });
-    const n = Math.min(await btns.count(), 4);
-    for (let i = 0; i < n; i++) {
-      const b = btns.nth(i);
-      if (!(await b.isVisible().catch(() => false))) continue;
-      const first = this.page.waitForEvent("filechooser", { timeout: 1500 }).catch(() => null);
-      await b.click({ timeout: 3000 }).catch(() => {});
-      let ch = await first;
-      if (!ch) {
-        const item = this.page
-          .getByRole("menuitem", { name: this.profile.menuItemRe })
-          .or(this.page.getByRole("button", { name: this.profile.menuItemRe }))
-          .or(this.page.getByText(this.profile.menuItemRe))
-          .first();
-        if (await item.isVisible({ timeout: 800 }).catch(() => false)) {
-          const second = this.page.waitForEvent("filechooser", { timeout: 3000 }).catch(() => null);
-          await item.click({ timeout: 3000 }).catch(() => {});
-          ch = await second;
-        }
-      }
-      if (ch) {
-        await ch.setFiles(await this.payloads());
-        return true;
-      }
-      await this.page.keyboard.press("Escape").catch(() => {});
-    }
-    return false;
+  private async viaInput() {
+    const r = await pageOp(this.page, "tagInput");
+    if (!r.found) throw new Error("no input[type=file] found in document");
+
+    const input = this.page.locator(`[${IN_ATTR}="1"]`);
+    await input.setInputFiles(this.files, { timeout: 10000 });
   }
 
-  private async viaPaste(): Promise<boolean> {
-    for (let i = 0; i < this.files.length; i++) {
-      const f = this.files[i];
-      const item = {
-        name: f.name,
-        mime: f.mime,
-        b64: (await fs.readFile(f.absPath)).toString("base64"),
-      };
-      await this.composer.evaluate((el, it) => {
-        const bin = atob(it.b64);
-        const u8 = new Uint8Array(bin.length);
-        for (let k = 0; k < bin.length; k++) u8[k] = bin.charCodeAt(k);
-        const dt = new DataTransfer();
-        dt.items.add(new File([u8], it.name, { type: it.mime }));
-        (el as HTMLElement).focus();
-        el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
-      }, item);
-      await this.settle(false, 20_000, i + 1);
-    }
-    return true;
-  }
+  private async viaChooser() {
+    const hasPlus = await pageOp(this.page, "tagPlus");
+    if (!hasPlus) throw new Error("plus/attach button not found in composer");
 
-  async settle(needSend: boolean, timeoutMs = 15_000 + 10_000 * this.files.length, expected = this.files.length, quietMs = 800) {
-    const t0 = Date.now();
-    let okSince = 0;
-    while (Date.now() - t0 < timeoutMs) {
-      const st = await readState(this.page, this.profile);
-      if (st.error && st.error !== "root-missing") throw new AttachmentError("upload-error", st.error);
-      if (this.net.failure) throw new AttachmentError("upload-network", this.net.failure);
-      const delta = st.tiles - this.baseline;
-      const ok =
-        delta >= expected &&
-        st.spinners === 0 &&
-        st.imgsLoaded &&
-        this.net.pending === 0 &&
-        (!needSend || st.sendEnabled === true);
-      if (ok) {
-        okSince ||= Date.now();
-        if (Date.now() - okSince >= quietMs) return;
-      } else {
-        okSince = 0;
-      }
-      await this.page.waitForTimeout(250);
-    }
-    const st = await readState(this.page, this.profile);
-    throw new AttachmentError(
-      "settle-timeout",
-      `tiles+${st.tiles - this.baseline}/${expected} spinners=${st.spinners} loaded=${st.imgsLoaded} pendingReq=${this.net.pending} send=${st.sendEnabled}`,
+    const direct = this.page.waitForEvent("filechooser", { timeout: 7000 });
+    direct.catch(() => {});
+
+    await this.page.locator(`[${PLUS_ATTR}="1"]`).click({ timeout: 3000 });
+
+    const item = this.page.getByRole("menuitem", { name: UPLOAD_MENU_RE }).first();
+    const itemVisible = await item.waitFor({ state: "visible", timeout: 2000 }).then(
+      () => true,
+      () => false,
     );
-  }
 
-  async verifySent(): Promise<boolean> {
-    for (let i = 0; i < 20; i++) {
-      const st = await readState(this.page, this.profile);
-      if (st.tiles <= this.baseline) return true;
-      await this.page.waitForTimeout(250);
+    if (itemVisible) {
+      await item.click({ timeout: 2000 });
     }
-    return false;
+
+    try {
+      const chooser = await direct;
+      await chooser.setFiles(this.files);
+    } catch (e) {
+      await this.page.keyboard.press("Escape").catch(() => {});
+      throw e;
+    }
   }
 
-  async abort() {
-    await this.clearTiles().catch(() => {});
-    this.dispose();
+  private async viaDrop(kind: "drop" | "paste") {
+    for (const f of this.files) {
+      await this.page.evaluate(
+        async ({ name, mimeType, b64, kind }) => {
+          const bin = atob(b64);
+          const u8 = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+          const dt = new DataTransfer();
+          dt.items.add(new File([u8], name, { type: mimeType }));
+
+          const ta = document.querySelector<HTMLElement>(
+            '#prompt-textarea, [data-testid="prompt-textarea"], .ProseMirror[contenteditable="true"], rich-textarea, .ql-editor',
+          );
+          if (!ta) throw new Error("composer textarea not found");
+
+          if (kind === "paste") {
+            ta.focus();
+            ta.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt }));
+          } else {
+            const form = ta.closest("form") ?? ta;
+            for (const type of ["dragenter", "dragover", "drop"]) {
+              form.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+            }
+          }
+        },
+        {
+          name: f.name,
+          mimeType: f.mimeType,
+          b64: f.buffer.toString("base64"),
+          kind,
+        },
+      );
+    }
   }
 
-  dispose() {
-    this.net.dispose();
+  private async waitForSettled(expected: number, timeoutMs: number) {
+    const end = Date.now() + timeoutMs;
+    let stable = 0;
+    let s: ComposerState = await pageOp(this.page, "state");
+
+    while (Date.now() < end) {
+      s = await pageOp(this.page, "state");
+      if (s.alert && ERR_RE.test(s.alert)) {
+        return { ok: false as const, s, toast: true };
+      }
+      if (s.count >= expected && !s.busy) {
+        stable ||= Date.now();
+        if (Date.now() - stable >= 600) {
+          return { ok: true as const, s, toast: false };
+        }
+      } else {
+        stable = 0;
+      }
+      await sleep(250);
+    }
+
+    return { ok: false as const, s, toast: false };
+  }
+
+  async settle(requireSend = false, timeoutMs = 25000): Promise<void> {
+    const res = await this.waitForSettled(this.files.length, timeoutMs);
+    if (!res.ok) {
+      throw new AttachmentError(
+        "settle",
+        res.toast
+          ? `Upload failed or limit reached: ${res.s.alert}`
+          : `Images did not finish uploading within ${timeoutMs / 1000}s`,
+      );
+    }
+  }
+
+  async verifySent(timeoutMs = 5000): Promise<void> {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      const s = await pageOp(this.page, "state");
+      if (s.count === 0) return;
+      await sleep(250);
+    }
+  }
+
+  async abort(): Promise<void> {
+    await this.clearStale();
+  }
+
+  dispose(): void {
+    this.disposed = true;
   }
 }
