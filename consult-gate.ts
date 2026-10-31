@@ -10,6 +10,8 @@ export interface GateState {
   reason?: string;
   provider?: string;
   consults: number;
+  validationRejects?: number;
+  execFailures?: number;
   since: number;
 }
 
@@ -54,29 +56,25 @@ function parseConsultStatus(text: string): { state: string; needs: number } | nu
 export function installConsultGate(pi: ExtensionAPI) {
   const getGateFile = (cwd: string) => {
     const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
-    return path.join(process.env.TEMP ?? "/tmp", `ai-consult-gate-${hash}.json`);
+    const tmp = process.env.TEMP || process.env.TMP || "/tmp";
+    return path.join(tmp, `ai-consult-gate-${hash}.json`);
   };
 
   const loadGate = (cwd: string): GateState => {
     try {
-      const content = fs.readFileSync(getGateFile(cwd), "utf8");
-      const g = JSON.parse(content) as GateState;
-      // Auto-expire after 2 hours
-      if (Date.now() - g.since > 2 * 60 * 60 * 1000) {
-        return { phase: "idle", consults: 0, since: Date.now() };
+      const file = getGateFile(cwd);
+      if (fs.existsSync(file)) {
+        return JSON.parse(fs.readFileSync(file, "utf8"));
       }
-      return g;
-    } catch {
-      return { phase: "idle", consults: 0, since: Date.now() };
-    }
+    } catch {}
+    return { phase: "idle", consults: 0, since: Date.now() };
   };
 
-  const saveGate = (cwd: string, g: GateState) => {
-    const file = getGateFile(cwd);
-    const tmp = `${file}.tmp.${Date.now()}`;
-    fs.writeFileSync(tmp, JSON.stringify(g, null, 2), "utf8");
-    fs.renameSync(tmp, file);
-    return g;
+  const saveGate = (cwd: string, state: GateState) => {
+    try {
+      const file = getGateFile(cwd);
+      fs.writeFileSync(file, JSON.stringify(state, null, 2), "utf8");
+    } catch {}
   };
 
   const halt = (ctx: any, g: GateState, reason: string) => {
@@ -106,6 +104,8 @@ export function installConsultGate(pi: ExtensionAPI) {
         phase: "required",
         provider,
         consults: 0,
+        validationRejects: 0,
+        execFailures: 0,
         since: Date.now(),
       });
       return { action: "continue" };
@@ -117,6 +117,8 @@ export function installConsultGate(pi: ExtensionAPI) {
         ...g,
         phase: "required",
         consults: 0,
+        validationRejects: 0,
+        execFailures: 0,
         reason: undefined,
       });
       if (ctx?.ui?.notify) {
@@ -131,10 +133,34 @@ export function installConsultGate(pi: ExtensionAPI) {
   });
 
   // 2. Authorize or block tool calls
+  // INVARIANT: Read-only reconnaissance and consult tools are NEVER deadlocked!
   pi.on("tool_call", async (event, ctx) => {
     const g = loadGate(ctx.cwd);
     if (g.phase === "idle" || g.phase === "final") return undefined;
 
+    const t = event.toolName;
+
+    // A. Read-only reconnaissance tools are ALWAYS allowed (to collect logs, diffs, status)
+    if (READ_ONLY_TOOLS.has(t)) return undefined;
+    if (t === "bash" && isBashReadOnly(String(event.input?.command ?? ""))) return undefined;
+
+    // B. Consult tools are ALWAYS allowed when in 'required' phase
+    // And even if in 'halted' phase, allow up to 2 recovery retries so the agent can fix its prompt!
+    if (CONSULT_TOOL.test(t)) {
+      if (g.phase === "halted") {
+        const retries = g.execFailures ?? 0;
+        if (retries < 2) {
+          return undefined; // Allow recovery retry
+        }
+        return {
+          block: true,
+          reason: `⛔ [FAIL-CLOSED HALT]: Konsultatsiya qayta-qayta xato berdi (${g.reason}). Agent to'xtatildi! Foydalanuvchi /consult-resume yoki /consult-off buyrug'ini kiritishi kerak.`,
+        };
+      }
+      return undefined;
+    }
+
+    // C. Any state-modifying tool (edit, write, dangerous bash) is BLOCKED!
     if (g.phase === "halted") {
       return {
         block: true,
@@ -142,17 +168,6 @@ export function installConsultGate(pi: ExtensionAPI) {
       };
     }
 
-    const t = event.toolName;
-
-    // Consult tools and read-only reconnaissance are ALWAYS allowed
-    if (CONSULT_TOOL.test(t) || READ_ONLY_TOOLS.has(t)) return undefined;
-
-    // Read-only bash is allowed (to collect logs, diffs, status)
-    if (t === "bash" && isBashReadOnly(String(event.input?.command ?? ""))) {
-      return undefined;
-    }
-
-    // Any state-modifying tool (edit, write, dangerous bash) is BLOCKED!
     return {
       block: true,
       reason:
@@ -171,31 +186,64 @@ export function installConsultGate(pi: ExtensionAPI) {
     if (g.phase === "idle" || g.phase === "final") return;
 
     const d = event.details && typeof event.details === "object" ? event.details : undefined;
-
-    // Structured failure checks
-    if (event.isError === true) {
-      halt(ctx, g, `${event.toolName} tool ijro xatosi berdi`);
-      return;
-    }
-    if (d?.success === false) {
-      halt(ctx, g, `${event.toolName} xatolik berdi: ${d.error ?? "noma'lum xatolik"}`);
-      return;
-    }
-
     const text = (event.content ?? []).map((c: any) => c.text ?? "").join("\n");
 
-    // Check for explicit harness rejection banners ONLY at the start of output (never searching model body)
-    if (/^🛑\s*\[(REJECTED|.*XATOSI)\]/im.test(text.slice(0, 150))) {
-      halt(ctx, g, `${event.toolName} xatosi: ${text.slice(0, 120)}`);
+    // A. Pre-flight validation rejection (prompt format, language guard, missing fields)
+    // A rejection has ZERO external side effects, costs zero tokens on ChatGPT, and is safe and cheap to retry!
+    const isValidationRejection =
+      d?.isValidation === true ||
+      d?.consultKind === "validation_rejected" ||
+      /^\s*(?:🛑\s*)?\[REJECTED\]/m.test(text);
+
+    if (isValidationRejection) {
+      const rejects = (g.validationRejects ?? 0) + 1;
+      const reason = d?.error || text.slice(0, 160);
+      if (rejects >= 5) {
+        halt(ctx, g, `5 ta ketma-ket so'rov rad etildi: ${reason}`);
+        return;
+      }
+      // Stay in 'required' phase: the agent can and should fix its prompt and try again!
+      saveGate(ctx.cwd, { ...g, validationRejects: rejects, reason });
+      if (ctx?.ui?.notify) {
+        ctx.ui.notify(
+          `⚠️ [CONSULTATION GATE]: So'rov tekshiruvdan o'tmadi (${rejects}/5): ${reason.slice(0, 90)}. Promptni to'g'rilab qayta chaqiring.`,
+          "warning",
+        );
+      }
       return;
     }
 
-    // Check for FINAL state via structured details or anchored status text
-    const isStructuredFinal = d?.status === "FINAL" || d?.success === true && text.includes("STATUS: FINAL");
+    // B. Real tool execution or transport failure
+    if (event.isError === true || d?.success === false) {
+      const failures = (g.execFailures ?? 0) + 1;
+      const err = d?.error || `${event.toolName} tool ijro xatosi berdi`;
+      if (failures >= 3) {
+        halt(ctx, g, `${failures} ta ketma-ket ijro xatosi: ${err}`);
+        return;
+      }
+      saveGate(ctx.cwd, { ...g, execFailures: failures, reason: err });
+      if (ctx?.ui?.notify) {
+        ctx.ui.notify(
+          `⚠️ [CONSULTATION GATE]: ${event.toolName} xato berdi (${failures}/3): ${err.slice(0, 80)}. Qayta urinib ko'rilmoqda...`,
+          "warning",
+        );
+      }
+      return;
+    }
+
+    // C. Check for FINAL state via structured details or anchored status text
+    const isStructuredFinal = d?.status === "FINAL" || (d?.success === true && text.includes("STATUS: FINAL"));
     const consults = g.consults + 1;
 
     if (isStructuredFinal) {
-      saveGate(ctx.cwd, { ...g, phase: "final", consults });
+      saveGate(ctx.cwd, {
+        ...g,
+        phase: "final",
+        consults,
+        validationRejects: 0,
+        execFailures: 0,
+        reason: undefined,
+      });
       if (ctx?.ui?.notify) {
         ctx.ui.notify(
           `✅ [CONSULTATION GATE]: ${g.provider ?? "AI"} konsultatsiyasi FINAL deb qabul qilindi. Kod tahrirlashga ruxsat berildi.`,
@@ -211,7 +259,7 @@ export function installConsultGate(pi: ExtensionAPI) {
     }
 
     // Stays in "required" phase: reconnaissance and follow-up consults allowed
-    saveGate(ctx.cwd, { ...g, consults });
+    saveGate(ctx.cwd, { ...g, consults, validationRejects: 0, execFailures: 0 });
   });
 
   // User slash commands to inspect or override gate
@@ -237,16 +285,22 @@ export function installConsultGate(pi: ExtensionAPI) {
   pi.registerCommand("consult-resume", {
     description: "Halted holatdagi konsultatsiya darvozasini qayta faollashtirish (required)",
     handler: async (_args: string, ctx: any) => {
-      saveGate(ctx.cwd, { phase: "required", consults: 0, since: Date.now() });
-      ctx.ui.notify("Gate qayta faollashtirildi (phase: required)", "info");
+      saveGate(ctx.cwd, {
+        phase: "required",
+        consults: 0,
+        validationRejects: 0,
+        execFailures: 0,
+        since: Date.now(),
+      });
+      ctx.ui.notify("Gate: qayta faollashtirildi (required)", "info");
     },
   });
 
   pi.registerCommand("consult-off", {
-    description: "Konsultatsiya darvozasini o'chirish (idle holatga tushirish)",
+    description: "Fail-closed consultation gate'ni butunlay o'chirish (idle)",
     handler: async (_args: string, ctx: any) => {
       saveGate(ctx.cwd, { phase: "idle", consults: 0, since: Date.now() });
-      ctx.ui.notify("Gate o'chirildi (phase: idle)", "info");
+      ctx.ui.notify("Gate: o'chirildi (idle)", "info");
     },
   });
 }

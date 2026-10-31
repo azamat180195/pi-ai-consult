@@ -425,7 +425,11 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
         return `Unanswered requests from external AI: ${missing.join(", ")}. Provide evidence or mark with {status: "unavailable", note: "..."}.`;
       }
     }
-    const textToCheck = p.prompt || p.brief?.goal || p.brief?.hypothesis?.statement || "";
+    const textToCheck = [
+      p.prompt,
+      p.brief?.goal,
+      p.brief?.hypothesis?.statement,
+    ].filter(Boolean).join("\n\n");
     const g = checkEnglish(textToCheck);
     if (!g.ok) {
       return `Prompt MUST be written in English (${g.reason}). Rewrite your prompt in English and call again. (The final response to the user remains in Uzbek).`;
@@ -650,7 +654,7 @@ Structure:
     if (callError) {
       return {
         content: [{ type: "text", text: `🛑 [REJECTED]: ${callError}` }],
-        details: { success: false, error: callError },
+        details: { success: false, error: callError, isValidation: true, consultKind: "validation_rejected" },
       };
     }
 
