@@ -17,6 +17,8 @@ export interface GateState {
 
 const TRIGGER =
   /\b(consult|chatgpt|gpt|claude|gemini|sonnet|opus|argon)\b|konsult|maslahat|suhbatlash|maslaxat|консульт|совет/i;
+const IGNORE_TRIGGER =
+  /^\s*(?:\/)?(?:consult-(?:off|final|resume|status)|consult\s+(?:off|final|resume|status))/i;
 const CONSULT_TOOL = /^consult_(claude|chatgpt|gemini|ai)$/;
 const READ_ONLY_TOOLS = new Set([
   "read",
@@ -90,15 +92,16 @@ export function installConsultGate(pi: ExtensionAPI) {
   // 1. Capture user input intent & self-heal halted gates on new user messages
   pi.on("input", async (event, ctx) => {
     const text = event.text ?? "";
-    if (text.startsWith("/")) return { action: "continue" };
+    if (text.startsWith("/") || IGNORE_TRIGGER.test(text)) return { action: "continue" };
 
     const g = loadGate(ctx.cwd);
 
-    if (TRIGGER.test(text)) {
+    if (TRIGGER.test(text) && !IGNORE_TRIGGER.test(text)) {
       let provider = "AI";
-      if (/chatgpt|gpt/i.test(text)) provider = "ChatGPT";
-      else if (/claude|sonnet|opus/i.test(text)) provider = "Claude";
-      else if (/gemini|argon/i.test(text)) provider = "Gemini";
+      // Check specific model names first so "ChatGPT muammosini Sonnet bilan maslahatlash" correctly matches Sonnet!
+      if (/sonnet|claude|opus/i.test(text)) provider = "Claude";
+      else if (/argon|gemini/i.test(text)) provider = "Gemini";
+      else if (/chatgpt|gpt/i.test(text)) provider = "ChatGPT";
 
       saveGate(ctx.cwd, {
         phase: "required",
@@ -231,11 +234,23 @@ export function installConsultGate(pi: ExtensionAPI) {
       return;
     }
 
-    // C. Check for FINAL state via structured details or anchored status text
-    const isStructuredFinal = d?.status === "FINAL" || (d?.success === true && text.includes("STATUS: FINAL"));
+    // C. Check for Actionable Advice or FINAL state
+    // INVARIANT: When the external AI delivers substantive advice or code blocks in Round 1,
+    // unlock the gate IMMEDIATELY! Never trap the agent in an artificial multi-round confirmation loop.
+    const hasSubstantiveAdvice =
+      text.length > 150 ||
+      /```(?:ts|typescript|javascript|kotlin|java|bash|json|sql)\b[\s\S]*?```/.test(text) ||
+      /Verdict|Recommendations?|Implementation|Architecture/i.test(text);
+
+    const isActionable =
+      d?.status === "FINAL" ||
+      text.includes("STATUS: FINAL") ||
+      (d?.success === true && hasSubstantiveAdvice) ||
+      (event.isError !== true && hasSubstantiveAdvice && text.length > 100);
+
     const consults = g.consults + 1;
 
-    if (isStructuredFinal) {
+    if (isActionable) {
       saveGate(ctx.cwd, {
         ...g,
         phase: "final",
@@ -246,7 +261,7 @@ export function installConsultGate(pi: ExtensionAPI) {
       });
       if (ctx?.ui?.notify) {
         ctx.ui.notify(
-          `✅ [CONSULTATION GATE]: ${g.provider ?? "AI"} konsultatsiyasi FINAL deb qabul qilindi. Kod tahrirlashga ruxsat berildi.`,
+          `✅ [CONSULTATION GATE]: ${g.provider ?? "AI"} konsultatsiyasi qabul qilindi (1-raundda amaliy yechim olindi). Kod tahrirlashga ruxsat berildi.`,
           "info",
         );
       }

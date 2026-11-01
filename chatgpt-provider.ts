@@ -4,6 +4,7 @@ import type { ConsultResult } from "./claude-provider.js";
 import type { ImageFile } from "./image-attachments.js";
 import { ImageAttachSession } from "./image-upload.js";
 import { drainTabIfBusy } from "./browser-tab-lease.js";
+import { reconcileChatGPTTurn } from "./consult-reconcile.js";
 
 const PROMO_KEYWORDS =
   "meet codex|download the app|get the app|desktop app|try plus|try chatgpt plus|stay logged in|survey|what's new|new feature|cookie|privacy";
@@ -280,34 +281,55 @@ export class ChatGPTProvider {
       } catch {}
     }
 
-    // 1.1 Turn-Anchored Recovery Check
+    // 1.1 Live DOM Turn Reconciliation (Crash & Battery-Depletion Recovery)
+    // If the machine abruptly shut down while ChatGPT was generating, or the user re-asked the same question,
+    // inspect the live DOM: if the last user turn matches the prompt and the assistant response is complete,
+    // REUSE the existing response directly without re-typing or re-submitting!
     if (!options.newChat && page.url().includes("chatgpt.com/c/")) {
-      // Progressive wait for React SPA hydration on slow network (up to 15s)
-      const hydStart = Date.now();
-      while (Date.now() - hydStart < 15000) {
-        const len = await page.evaluate(() => (document.querySelector("main") || document.body).innerText.length);
-        if (len > 1500) break;
-        await page.waitForTimeout(500);
-      }
+      try {
+        const rec = await reconcileChatGPTTurn(page, {
+          incomingPrompt: prompt,
+          log: (m) => console.error(m),
+        });
 
-      const lastSaved = await ChatStore.getLastChat("chatgpt");
-      const isSamePrompt =
-        lastSaved?.lastPrompt &&
-        (lastSaved.lastPrompt.trim() === prompt.trim() ||
-          prompt.trim().startsWith(lastSaved.lastPrompt.trim().slice(0, 60)) ||
-          lastSaved.lastPrompt.trim().startsWith(prompt.trim().slice(0, 60)));
-
-      if (isSamePrompt) {
-        const targetNonce = lastSaved?.nonce;
-        const recoveredText = await this.extractResponse(page);
-        if (recoveredText && recoveredText.length > 50) {
-          await ChatStore.saveLastChat("chatgpt", { chatUrl: page.url(), lastPrompt: prompt, nonce: targetNonce });
+        if (rec.decision === "REUSE" && rec.answer && rec.answer.length > 50) {
+          const cleanText = this.cleanResponse(rec.answer);
+          await ChatStore.saveLastChat("chatgpt", { chatUrl: page.url(), lastPrompt: prompt, nonce });
           return {
             success: true,
-            text: recoveredText,
+            text: cleanText,
             chatUrl: page.url(),
           };
         }
+
+        if (rec.decision === "WAIT") {
+          // Cloud generation is still active (streaming marker or stop button visible).
+          // Wait for the resumed cloud stream to settle instead of typing a duplicate!
+          const waitStart = Date.now();
+          while (Date.now() - waitStart < 90_000) {
+            const isGenerating = await page.evaluate(() => {
+              const stop = document.querySelector(
+                '[data-testid="stop-button"], button[aria-label*="Stop" i]',
+              );
+              const streaming = document.querySelector('.result-streaming, [data-is-streaming="true"]');
+              return (!!stop && (stop as HTMLElement).offsetParent !== null) || !!streaming;
+            });
+            if (!isGenerating) break;
+            await page.waitForTimeout(1000);
+          }
+          const recovered = await this.extractResponse(page);
+          if (recovered && recovered.length > 50) {
+            const cleanText = this.cleanResponse(recovered);
+            await ChatStore.saveLastChat("chatgpt", { chatUrl: page.url(), lastPrompt: prompt, nonce });
+            return {
+              success: true,
+              text: cleanText,
+              chatUrl: page.url(),
+            };
+          }
+        }
+      } catch (e: any) {
+        console.error(`[reconcile:chatgpt] Reconciliation skipped: ${e.message}`);
       }
     }
 
