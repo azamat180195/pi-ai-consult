@@ -8,6 +8,27 @@ export interface InfoNeed {
   how?: string;
 }
 
+export type ReplyKind =
+  | "FINAL"
+  | "ACTIONABLE"
+  | "NEEDS_EVIDENCE"
+  | "NEEDS_CONTINUATION"
+  | "NEEDS_CLARIFICATION";
+
+export interface ReplySignals {
+  chars: number;
+  codeBlocks: number;
+  codeLines: number;
+  headings: number;
+  proseChars: number;
+  openFence: boolean;
+  unterminatedStatus: boolean;
+  endsMidSentence: boolean;
+  refusal: boolean;
+  asksForInput: boolean;
+  substantive: boolean;
+}
+
 export interface ParsedReply {
   state: ConsultState | "UNKNOWN";
   needs: InfoNeed[];
@@ -158,4 +179,112 @@ export function isReadOnlyCommand(cmd: string): boolean {
     return false;
   }
   return looksLikeCommand(c);
+}
+
+export function analyzeReply(raw: string): ReplySignals {
+  const text = raw.replace(/\r\n?/g, "\n");
+  const hasEnd = text.includes("CONSULT_STATUS_END");
+  const unterminatedStatus = text.includes("CONSULT_STATUS_BEGIN") && !hasEnd;
+  const body = text.replace(BLOCK_RE, "").trim();
+
+  let open = false;
+  let codeLines = 0;
+  let codeBlocks = 0;
+  let headings = 0;
+  const prose: string[] = [];
+
+  for (const line of body.split("\n")) {
+    if (/^\s{0,3}(`{3,}|~{3,})/.test(line)) {
+      if (open) {
+        open = false;
+        codeBlocks++;
+      } else {
+        open = true;
+      }
+      continue;
+    }
+    if (open) {
+      if (line.trim()) codeLines++;
+      continue;
+    }
+    if (/^#{1,4}\s/.test(line)) headings++;
+    prose.push(line);
+  }
+
+  const proseText = prose.join("\n").trim();
+  const proseChars = proseText.length;
+
+  const refusal =
+    codeLines === 0 &&
+    /^(i can(?:'|’)?t|i cannot|i(?:'|’)m unable|i am unable|sorry\b)/i.test(body.slice(0, 200));
+
+  const asksForInput =
+    codeLines === 0 &&
+    /\b(please (provide|send|share|paste)|(could|can) you (provide|send|share|paste)|i need (you to|to see))\b/i.test(
+      proseText.slice(-600),
+    );
+
+  const lastLine = body.split("\n").filter((l) => l.trim()).pop() ?? "";
+  const endsMidSentence =
+    !hasEnd &&
+    !open &&
+    /([,;(:\-–]|\b(and|or|the|to|of|with|a|an|that|which))\s*$/i.test(lastLine);
+
+  const substantive =
+    !open &&
+    !refusal &&
+    !asksForInput &&
+    (codeLines >= 3 || (headings >= 2 && proseChars >= 500) || proseChars >= 1000);
+
+  return {
+    chars: raw.trim().length,
+    codeBlocks,
+    codeLines,
+    headings,
+    proseChars,
+    openFence: open,
+    unterminatedStatus,
+    endsMidSentence,
+    refusal,
+    asksForInput,
+    substantive,
+  };
+}
+
+export function classifyReply(
+  raw: string,
+  p: ParsedReply,
+  isError = false,
+): { kind: ReplyKind; sig: ReplySignals } {
+  const sig = analyzeReply(raw);
+  const needs = p.needs ?? [];
+  let kind: ReplyKind;
+
+  if (isError || sig.chars < 80) {
+    kind = "NEEDS_CLARIFICATION";
+  } else if (sig.openFence || sig.unterminatedStatus || sig.endsMidSentence) {
+    kind = "NEEDS_CONTINUATION";
+  } else if (p.state === "FINAL" && p.lint.length === 0) {
+    kind = "FINAL";
+  } else if (sig.substantive) {
+    kind = "ACTIONABLE";
+  } else if (p.state === "NEED_INFO" || needs.length > 0) {
+    kind = "NEEDS_EVIDENCE";
+  } else if (sig.refusal || sig.asksForInput || sig.proseChars < 500) {
+    kind = "NEEDS_CLARIFICATION";
+  } else {
+    kind = "ACTIONABLE";
+  }
+
+  return { kind, sig };
+}
+
+// Pre-send guard: rejects follow-ups whose only purpose is to extract FINAL / sign-off.
+const CONFIRM_ONLY =
+  /(confirm|sign[- ]?off|state:\s*FINAL|output .{0,40}\bFINAL\b|(say|reply|respond|declare).{0,40}\bFINAL\b)/i;
+
+export function isConfirmationOnly(prompt: string): boolean {
+  const body = prompt.replace(/RESPONSE PROTOCOL[\s\S]*$/i, "");
+  if (/###\s*EVIDENCE/i.test(body)) return false;
+  return CONFIRM_ONLY.test(body) && body.replace(CONFIRM_ONLY, "").trim().length < 400;
 }

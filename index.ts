@@ -38,7 +38,10 @@ import {
   MAX_ROUNDS,
   parseReply,
   isReadOnlyCommand,
+  classifyReply,
+  isConfirmationOnly,
   type ParsedReply,
+  type ReplyKind,
 } from "./protocol.js";
 
 import {
@@ -425,6 +428,10 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
         return `Unanswered requests from external AI: ${missing.join(", ")}. Provide evidence or mark with {status: "unavailable", note: "..."}.`;
       }
     }
+    // Invariant: Block artificial 'confirm FINAL' ping-pongs without new evidence or questions
+    if (p.prompt && isConfirmationOnly(p.prompt)) {
+      return "BLOCKED: this follow-up only asks the AI to confirm or sign off FINAL. A remote AI cannot run your local checks, and FINAL is not required to proceed. Proceed with local implementation and validation instead.";
+    }
     const textToCheck = [
       p.prompt,
       p.brief?.goal,
@@ -437,74 +444,108 @@ export default function aiConsultExtension(pi: ExtensionAPI) {
     return null;
   }
 
-  function buildDirective(r: ParsedReply, loop: LoopState, incomplete: boolean): { status: string; text: string } {
+  function buildDirective(
+    rawText: string,
+    r: ParsedReply,
+    loop: LoopState,
+    incomplete: boolean,
+    isError = false,
+  ): { status: string; text: string; unlock: boolean; kind: ReplyKind | "UNRESOLVED" } {
     const tag = `round ${loop.round}/${MAX_ROUNDS}`;
 
     if (incomplete) {
       return {
         status: "INCOMPLETE",
+        unlock: false,
+        kind: "NEEDS_CONTINUATION",
         text: `STATUS: INCOMPLETE (${tag}) — reply was cut off while the model was still generating.
 MANDATORY: call again with newChat:false, intent:"clarify", prompt:"Your previous reply was cut off. Continue exactly from where you stopped and end with the CONSULT_STATUS block." Do NOT start a new chat. Do NOT treat partial text as an answer.`,
       };
     }
 
-    if (loop.nudges === -1) {
-      return {
-        status: "STUCK",
-        text: `STATUS: STUCK (${tag}) — external AI repeated the same request(s) after evidence was already supplied.
-MANDATORY: stop looping. Report to the user in Uzbek: what was asked, what was sent, and why the external model is not converging.`,
-      };
+    const { kind: classifiedKind, sig } = classifyReply(rawText, r, isError);
+    let kind: ReplyKind | "UNRESOLVED" = classifiedKind;
+
+    // Follow-up budget: after 2 rounds, degrade to ACTIONABLE if substantive
+    if (loop.round >= 3 && kind.startsWith("NEEDS_")) {
+      kind = sig.substantive ? "ACTIONABLE" : "UNRESOLVED";
     }
 
-    if (r.state === "NEED_INFO") {
-      const items = r.needs
-        .map((n) => {
-          const safe =
-            n.how && n.kind === "command_output"
-              ? isReadOnlyCommand(n.how)
-                ? " [read-only: run directly]"
-                : " [NOT read-only: ask user before running]"
-              : "";
-          return `  - ID: ${n.id} [${n.kind}] ${n.what}${n.how ? `\n      Command/Path: ${n.how}${safe}` : ""}`;
-        })
-        .join("\n");
+    const NEVER_CONFIRM =
+      "Do NOT call this tool to ask for FINAL, sign-off or confirmation: a remote AI cannot run your local checks, and FINAL is not required to proceed.";
 
-      return {
-        status: "NEEDS_FOLLOWUP",
-        text: `STATUS: NEEDS_FOLLOWUP (${tag}, detected via ${r.source}) — the external AI is WAITING for additional information/evidence. Your turn is NOT finished!
-MANDATORY NEXT ACTION:
-VISIBILITY RULE (CRITICAL): Before executing any tools, write 1-2 visible sentences to the user in Uzbek: "${r.source || "AI"} javob berdi: <asosiy xulosa>. Hozir so'ralgan ma'lumotlarni tekshirib, davom ettiraman..." (NEEDS_FOLLOWUP means do NOT write the final definitive report yet; it NEVER means stay silent!).
-1. Collect EXACTLY these items with your tools (bash/read/grep). Verbatim output only:
+    switch (kind) {
+      case "FINAL":
+        return {
+          status: "FINAL",
+          unlock: true,
+          kind: "FINAL",
+          text: `STATUS: FINAL (${tag}) — external AI declared nothing else needed.
+NEXT ACTION: proceed with implementation. Validate locally first (tsc --noEmit / node --check / bash -n / tests).
+${NEVER_CONFIRM}`,
+        };
+
+      case "ACTIONABLE":
+        return {
+          status: "ACTIONABLE",
+          unlock: true,
+          kind: "ACTIONABLE",
+          text: `STATUS: ACTIONABLE (${tag}) — implementable technical recommendations and code delivered (${sig.codeBlocks} code block(s), ${sig.codeLines} code lines; AI state: ${r.state}).
+NEXT ACTION: implement it now.
+  1. Validate locally: tsc --noEmit / node --check / bash -n / the project's tests.
+  2. ${NEVER_CONFIRM}
+  3. Proceed with file edits and code implementation directly. Do NOT make another consultation call just to beg for confirmation!`,
+        };
+
+      case "NEEDS_EVIDENCE": {
+        const items = r.needs
+          .map((n) => {
+            const safe =
+              n.how && n.kind === "command_output"
+                ? isReadOnlyCommand(n.how)
+                  ? " [read-only: run directly]"
+                  : " [NOT read-only: ask user before running]"
+                : "";
+            return `  - ID: ${n.id} [${n.kind}] ${n.what}${n.how ? `\n      Command/Path: ${n.how}${safe}` : ""}`;
+          })
+          .join("\n");
+
+        return {
+          status: "NEEDS_FOLLOWUP",
+          unlock: false,
+          kind: "NEEDS_EVIDENCE",
+          text: `STATUS: NEEDS_FOLLOWUP (${tag}) — the external AI needs data from your machine to reach a conclusion:
 ${items}
-2. Call this same tool again: newChat:false, intent:"evidence", evidence:[{needId, kind, source, content}] — one entry per ID.
-3. If an item cannot be obtained, still send it with status:"unavailable" and note:"<reason>".
-4. Never run a non-read-only command without explicit user approval.`,
-      };
-    }
+NEXT ACTION: collect the requested items using read-only tools and send ONE follow-up (newChat:false, intent:"evidence") with VERBATIM output.`,
+        };
+      }
 
-    if (r.state === "UNCERTAIN" || r.state === "UNKNOWN" || r.lint.length > 0) {
-      const issues = r.lint.length ? r.lint.map((l) => `  - ${l}`).join("\n") : "  - no CONSULT_STATUS block or unclear state";
-      return {
-        status: "NEEDS_CLARIFICATION",
-        text: `STATUS: NEEDS_CLARIFICATION (${tag}) — reply is vague, incomplete or technically suspicious:
-${issues}
-MANDATORY NEXT ACTION: call again with newChat:false, intent:"clarify" (in English). Quote the exact vague/broken part, ask for: exact commands/configs, expected output, and which statements are verified vs assumed. Also validate code blocks locally first (bash -n, tsc --noEmit, etc.). Do NOT guess and do NOT finish the turn.`,
-      };
-    }
+      case "NEEDS_CONTINUATION":
+        return {
+          status: "INCOMPLETE",
+          unlock: false,
+          kind: "NEEDS_CONTINUATION",
+          text: `STATUS: INCOMPLETE (${tag}) — reply was cut off mid-sentence or mid-code fence.
+NEXT ACTION: call once (newChat:false, intent:"clarify") asking the model to continue from the cut-off point.`,
+        };
 
-    return {
-      status: "FINAL",
-      text: `STATUS: FINAL (${tag}) — external AI declared nothing else needed and technical lint is clean.
-NEXT: write the final report to the user in UZBEK.
-Structure:
-1. 'Qaror' (1-2 gap: nima qilinadi)
-2. 'Nega aynan shu' (Asosiy sabablar, dalil bilan)
-3. 'Rad etilgan variantlar' (Jadval: Variant | Nega rad etildi | Qachon to'g'ri bo'lardi)
-4. 'Xatarlar va qanday yopildi' (Jadval: Xatar (race/leak/downtime/yuk) | Yechim | Dalil darajasi)
-5. 'Qoldiq xavf' (Lokal tekshirib bo'lmadi + kuzatiladigan metrika)
-6. 'Qo'llash va Rollback' (Aniq buyruqlar va rollback qadamlari)
-7. 'Maslahat tarixi' (Raundlar, kelishilgan yechim)`,
-    };
+      case "NEEDS_CLARIFICATION":
+        return {
+          status: "NEEDS_CLARIFICATION",
+          unlock: false,
+          kind: "NEEDS_CLARIFICATION",
+          text: `STATUS: NEEDS_CLARIFICATION (${tag}) — reply was empty, an error, or a refusal.
+NEXT ACTION: call once (newChat:false, intent:"clarify") restating the technical question in full.`,
+        };
+
+      default:
+        return {
+          status: "ACTIONABLE",
+          unlock: true,
+          kind: "ACTIONABLE",
+          text: `STATUS: ACTIONABLE (${tag}) — consultation round completed. Proceed with local implementation.`,
+        };
+    }
   }
 
   const consultParamsBase = {
@@ -798,17 +839,16 @@ Structure:
         };
         await ChatStore.setLoop(provider, nextLoop);
 
-        const d = buildDirective(parsed, nextLoop, false);
-
         // Human-friendly digest for TUI collapsed view and notification
         const rawBody = parsed.body || result.text || "";
+        const d = buildDirective(rawBody, parsed, nextLoop, false, !result.success);
         const bodyLines = rawBody.split("\n").map((l: string) => l.trim()).filter(Boolean);
         const snippet = bodyLines.slice(0, 3).join(" ").slice(0, 220);
-        const summaryHeader = `◆ [${provider.toUpperCase()} JAVOBI KELDI] · ${bodyLines.length} qator · holat: ${parsed.state}\n  Xulosa: ${snippet || "Javob muvaffaqiyatli qabul qilindi"}...\n`;
+        const summaryHeader = `◆ [${provider.toUpperCase()} JAVOBI KELDI] · ${bodyLines.length} qator · holat: ${d.status}\n  Xulosa: ${snippet || "Javob muvaffaqiyatli qabul qilindi"}...\n`;
 
         if (ctx?.ui?.notify) {
           ctx.ui.notify(
-            `💬 [ai-consult]: ${provider.toUpperCase()} javob berdi (${bodyLines.length} qator, ${parsed.state}) · ko'rib chiqilmoqda...`,
+            `💬 [ai-consult]: ${provider.toUpperCase()} javob berdi (${bodyLines.length} qator, ${d.status}) · ko'rib chiqilmoqda...`,
             "info",
           );
         }
@@ -823,12 +863,15 @@ Structure:
           details: {
             success: true,
             status: d.status,
+            kind: d.kind,
+            unlock: d.unlock,
             round: nextLoop.round,
             pending: nextLoop.pending,
             lint: parsed.lint,
             parsedVia: parsed.source,
             chatUrl: result.chatUrl,
             modelUsed: result.modelUsed,
+            images: resolved.images.map((i) => i.name),
           },
         };
       } catch (err: unknown) {

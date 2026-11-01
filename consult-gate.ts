@@ -243,7 +243,11 @@ export function installConsultGate(pi: ExtensionAPI) {
       /Verdict|Recommendations?|Implementation|Architecture/i.test(text);
 
     const isActionable =
+      d?.unlock === true ||
+      d?.kind === "ACTIONABLE" ||
+      d?.status === "ACTIONABLE" ||
       d?.status === "FINAL" ||
+      text.includes("STATUS: ACTIONABLE") ||
       text.includes("STATUS: FINAL") ||
       (d?.success === true && hasSubstantiveAdvice) ||
       (event.isError !== true && hasSubstantiveAdvice && text.length > 100);
