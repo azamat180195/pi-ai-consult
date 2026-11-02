@@ -801,9 +801,28 @@ NEXT ACTION: call once (newChat:false, intent:"clarify") restating the technical
 
         if (!result.success) {
           if (result.rateLimitHit) {
+            const head = `🛑 [RATE LIMIT HIT]: ${provider} is rate-limited until ${result.resetTime ?? "unknown"}.`;
+            const directive = `${head}\nSTATUS: STOP_AND_ASK_USER\n\nMANDATORY DIRECTIVE FOR THE AGENT:\n1. STOP IMMEDIATELY! Do NOT proceed or modify any code.\n2. DO NOT autonomously switch or redirect this task to another model or provider (e.g. Flash-Lite, local model) without explicit user permission!\n3. Call 'ask_user_question' ONCE to report to the user that ${provider} has hit its limit (reset time: ${result.resetTime ?? "ko'rsatilmagan"}), and ask how they want to proceed (wait, switch provider, or cancel).\n4. Do NOT attempt to retry or consult another model on your own.`;
+
+            // Rapid close on rate limit
+            setTimeout(async () => {
+              try {
+                await browserManager.closeTab(provider, scopeKey);
+              } catch {}
+            }, 2000);
+
             return {
-              content: [{ type: "text", text: result.error || "Rate limit reached" }],
-              details: result,
+              content: [{ type: "text", text: `${result.error}\n\n${directive}` }],
+              isError: true,
+              details: {
+                success: false,
+                status: "RATE_LIMITED",
+                rateLimitHit: true,
+                resetTime: result.resetTime,
+                noFailover: true,
+                stopAndAskUser: true,
+                error: result.error,
+              },
             };
           }
           return {

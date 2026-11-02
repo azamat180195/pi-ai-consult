@@ -216,6 +216,17 @@ export function installConsultGate(pi: ExtensionAPI) {
       return;
     }
 
+    // Pre-B. Rate Limit Hit -> Halt immediately to prevent autonomous model downgrade or failover
+    if (d?.rateLimitHit === true || d?.status === "RATE_LIMITED" || text.includes("STATUS: STOP_AND_ASK_USER")) {
+      const resetMsg = d?.resetTime ? ` (Qayta tiklanish: ${d.resetTime})` : "";
+      halt(
+        ctx,
+        g,
+        `🛑 [LIMIT TUGADI]: ${g.provider ?? "AI"} xabarlar limiti tugagan${resetMsg}. Agent o'zboshimchalik bilan boshqa zaif modelga o'tishi taqiqlanadi! Foydalanuvchiga ask_user_question orqali xabar bering.`,
+      );
+      return;
+    }
+
     // B. Real tool execution or transport failure
     if (event.isError === true || d?.success === false) {
       const failures = (g.execFailures ?? 0) + 1;

@@ -3,6 +3,7 @@ import { ChatStore } from "./chat-store.js";
 import type { ImageFile } from "./image-attachments.js";
 import { ImageAttachSession } from "./image-upload.js";
 import { drainTabIfBusy } from "./browser-tab-lease.js";
+import { geminiGuard, detectGeminiLimit } from "./gemini-guard.js";
 
 export interface GeminiConsultOptions {
   model?: string; // '4 Argon', '3.1 Pro', '3.8 Flash', '3.5 Flash-Lite'
@@ -17,6 +18,8 @@ export interface GeminiConsultResult {
   modelUsed?: string;
   reasoningUsed?: string;
   success: boolean;
+  rateLimitHit?: boolean;
+  resetTime?: string;
   error?: string;
 }
 
@@ -487,6 +490,20 @@ export class GeminiProvider {
       await page.waitForTimeout(500);
     }
 
+    // 1) Pre-flight Guard: Check if Gemini is already rate-limited before touching composer
+    const preGuard = await geminiGuard(page, { requestedModel, strict: false });
+    if (preGuard) {
+      return {
+        text: "",
+        modelUsed: preGuard.activeModel || requestedModel,
+        reasoningUsed: requestedReasoning,
+        success: false,
+        rateLimitHit: preGuard.rateLimitHit,
+        resetTime: preGuard.resetTime,
+        error: preGuard.error,
+      };
+    }
+
     // Set model and reasoning level
     const modelRes = await this.setModelAndReasoning(
       page,
@@ -506,6 +523,20 @@ export class GeminiProvider {
     }
     const modelUsed = modelRes.modelUsed;
     const reasoningUsed = modelRes.reasoningUsed;
+
+    // 2) Post-Model Guard: Assert that active model is NOT auto-downgraded to Flash-Lite
+    const postModelGuard = await geminiGuard(page, { requestedModel, strict: true });
+    if (postModelGuard) {
+      return {
+        text: "",
+        modelUsed: postModelGuard.activeModel || requestedModel,
+        reasoningUsed: requestedReasoning,
+        success: false,
+        rateLimitHit: postModelGuard.rateLimitHit,
+        resetTime: postModelGuard.resetTime,
+        error: postModelGuard.error,
+      };
+    }
 
     // Ensure no lingering Angular CDK overlays or Google promo banners block the editor
     await page.keyboard.press("Escape").catch(() => {});
@@ -607,6 +638,22 @@ export class GeminiProvider {
           error: `🛑 [Rasm yuklanishi tugamadi]: Gemini rasmni to'liq yuklab bo'lmadi: ${settleErr.message}`,
         };
       }
+    }
+
+    // 3) Pre-Send Guard: TOCTOU check right before clicking Send (clear composer on abort)
+    const preSendGuard = await geminiGuard(page, { requestedModel, strict: false });
+    if (preSendGuard) {
+      await page.keyboard.press("ControlOrMeta+a").catch(() => {});
+      await page.keyboard.press("Backspace").catch(() => {});
+      return {
+        text: "",
+        modelUsed: preSendGuard.activeModel || modelUsed,
+        reasoningUsed,
+        success: false,
+        rateLimitHit: preSendGuard.rateLimitHit,
+        resetTime: preSendGuard.resetTime,
+        error: preSendGuard.error,
+      };
     }
 
     // Click send
