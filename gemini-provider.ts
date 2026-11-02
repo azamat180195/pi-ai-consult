@@ -387,12 +387,16 @@ export class GeminiProvider {
       if (targetItem) {
         // Read if already selected
         const isAlreadyChecked = await targetItem.evaluate((el: Element) => {
+          const hasCheckIcon = Array.from(el.querySelectorAll("mat-icon")).some(
+            (icon) => (icon.textContent || "").trim() === "check",
+          );
           return (
             el.getAttribute("aria-checked") === "true" ||
             el.getAttribute("aria-selected") === "true" ||
             el.classList.contains("mat-mdc-radio-checked") ||
             el.classList.contains("mat-radio-checked") ||
-            !!el.querySelector("mat-icon:has-text('check'), [class*='check'], [data-state='checked']")
+            hasCheckIcon ||
+            !!el.querySelector("[class*='check'], [data-state='checked']")
           );
         }).catch(() => false);
 
