@@ -3,6 +3,7 @@ import { ChatStore } from "./chat-store.js";
 import type { ImageFile } from "./image-attachments.js";
 import { ImageAttachSession } from "./image-upload.js";
 import { drainTabIfBusy } from "./browser-tab-lease.js";
+import { matchUserTurn } from "./consult-reconcile.js";
 
 export interface ConsultResult {
   success: boolean;
@@ -328,42 +329,75 @@ export class ClaudeProvider {
     page: Page,
     nonce: string,
     prompt: string,
-  ): Promise<{ found: boolean; answered: boolean; streaming: boolean; text: string }> {
-    return page.evaluate(
-      ({ tag, pSub }) => {
+  ): Promise<{ found: boolean; answered: boolean; streaming: boolean; text: string; matchedBy?: "nonce" | "canonical" }> {
+    const raw = await page.evaluate(
+      ({ tag }) => {
         const userMsgs = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="user-message"]'));
         const assistantMsgs = Array.from(
           document.querySelectorAll<HTMLElement>('[data-testid="assistant-message"], .font-claude-response'),
         );
 
-        if (userMsgs.length === 0) return { found: false, answered: false, streaming: false, text: "" };
+        if (userMsgs.length === 0) {
+          return { found: false, answered: false, streaming: false, text: "", lastUserText: "", matchedUserIndex: -1, userCount: 0, matchedBy: null as any };
+        }
 
+        // 1. Primary Anchor: Exact [ref <nonce>]
         let matchedUserIndex = -1;
+        let matchedBy: "nonce" | "canonical" | null = null;
         if (tag) {
           matchedUserIndex = userMsgs.findLastIndex((u) => (u.innerText || u.textContent || "").includes(tag));
+          if (matchedUserIndex !== -1) matchedBy = "nonce";
         }
 
-        if (matchedUserIndex === -1 && pSub) {
-          matchedUserIndex = userMsgs.findLastIndex((u) => {
-            const t = (u.innerText || u.textContent || "").trim();
-            return t.includes(pSub) || pSub.includes(t.slice(0, 50));
-          });
-        }
+        const lastUserText = (userMsgs[userMsgs.length - 1]?.innerText || userMsgs[userMsgs.length - 1]?.textContent || "").trim();
 
-        if (matchedUserIndex === -1) return { found: false, answered: false, streaming: false, text: "" };
+        return {
+          matchedUserIndex,
+          matchedBy,
+          userCount: userMsgs.length,
+          lastUserText,
+          assistantCount: assistantMsgs.length,
+        };
+      },
+      { tag: `[ref ${nonce}]` },
+    );
 
-        const userEl = userMsgs[matchedUserIndex];
-        const nextUserEl = userMsgs[matchedUserIndex + 1];
+    let idx = raw.matchedUserIndex;
+    let matchedBy = raw.matchedBy;
+
+    // 2. Canonical Reconciliation: ONLY if nonce not found AND checking strictly against the LAST user turn
+    if (idx === -1 && raw.lastUserText) {
+      const match = matchUserTurn(prompt, raw.lastUserText);
+      if (match.ok) {
+        idx = raw.userCount - 1;
+        matchedBy = "canonical";
+      }
+    }
+
+    if (idx === -1) {
+      return { found: false, answered: false, streaming: false, text: "" };
+    }
+
+    // Extract the assistant text following that matched user turn
+    return page.evaluate(
+      ({ userIndex, matchedBy }) => {
+        const userMsgs = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="user-message"]'));
+        const assistantMsgs = Array.from(
+          document.querySelectorAll<HTMLElement>('[data-testid="assistant-message"], .font-claude-response'),
+        );
+
+        const isStreaming = !!document.querySelector(
+          '[data-is-streaming="true"], button[aria-label*="Stop" i], button[data-testid*="stop" i]',
+        );
+
+        const userEl = userMsgs[userIndex];
+        const nextUserEl = userMsgs[userIndex + 1];
 
         const matchedAssistant = assistantMsgs.find((a) => {
           const followsUser = !!(userEl.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING);
           const precedesNextUser = !nextUserEl || !!(nextUserEl.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_PRECEDING);
           return followsUser && precedesNextUser;
         });
-
-        const isStreaming = !!document.querySelector(
-          '[data-is-streaming="true"], button[aria-label*="Stop" i], button[data-testid*="stop" i]',
-        );
 
         if (matchedAssistant) {
           let text = "";
@@ -390,12 +424,13 @@ export class ClaudeProvider {
             answered: text.length > 50,
             streaming: isStreaming,
             text,
+            matchedBy,
           };
         }
 
-        return { found: true, answered: false, streaming: isStreaming, text: "" };
+        return { found: true, answered: false, streaming: isStreaming, text: "", matchedBy };
       },
-      { tag: `[ref ${nonce}]`, pSub: prompt.trim().slice(0, 50) },
+      { userIndex: idx, matchedBy },
     );
   }
 

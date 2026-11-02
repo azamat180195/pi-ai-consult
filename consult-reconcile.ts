@@ -102,6 +102,60 @@ function fiveWordShingles(text: string): Set<string> {
   return result;
 }
 
+export const STATIC_PREAMBLES: string[] = [
+  "You are acting as a senior infrastructure and software architect performing a rigorous design review. Be direct and critical; disagree with me if my thinking is flawed.",
+  "We request an architectural and UI/UX design review regarding",
+  "We request an architectural and UI/UX design review",
+];
+
+const tokenize = (s: string): string[] =>
+  s
+    .normalize("NFKC")
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_.]+/u)
+    .map((t) => t.replace(/^\.+|\.+$/g, ""))
+    .filter((t) => t.length >= 3);
+
+const PREAMBLE_TOKENS = new Set(STATIC_PREAMBLES.flatMap(tokenize));
+
+export function stripWrappers(s: string): string {
+  let t = s.normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "");
+  t = t.replace(/^\s*\[ai-consult\s*[·-][^\]\r\n]*\]\s*/gi, " ");
+  t = t.replace(/^\s*\[ref\s+[a-z0-9_-]{4,}\]\s*$/gim, " ");
+  t = t.replace(/---\s*\nRESPONSE PROTOCOL[\s\S]*$/gi, " ");
+  t = t.replace(/\[ATTACHMENT MANIFEST:[\s\S]*?\]/gi, " ");
+  for (const p of STATIC_PREAMBLES) t = t.split(p).join(" ");
+  return t;
+}
+
+export const canonicalCore = (s: string) =>
+  stripWrappers(s)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+
+export function coreTokens(prompt: string, max = 60): string[] {
+  const uniq = Array.from(new Set(tokenize(stripWrappers(prompt)))).filter(
+    (t) => !PREAMBLE_TOKENS.has(t) && (t.length >= 6 || /[0-9_.]/.test(t)),
+  );
+  return uniq.sort((a, b) => b.length - a.length).slice(0, max);
+}
+
+export interface TurnMatch {
+  ok: boolean;
+  score: number;
+  head: number;
+  tail: number;
+  core: number;
+  reason: string;
+}
+
+const MIN_SCORE = 0.97;
+const MIN_SEGMENT = 0.9;
+const MIN_CORE = 0.85;
+const MIN_CORE_TOKENS = 6;
+const SEG = 400;
+
 export function promptSimilarity(a: string, b: string): number {
   const left = canonicalizePrompt(a);
   const right = canonicalizePrompt(b);
@@ -122,6 +176,56 @@ export function promptSimilarity(a: string, b: string): number {
   const union = new Set([...aShingles, ...bShingles]).size;
 
   return union === 0 ? 0 : intersection / union;
+}
+
+export function matchUserTurn(prompt: string, turnText: string): TurnMatch {
+  const bad = (reason: string, score = 0, head = 0, tail = 0, core = 0): TurnMatch => ({
+    ok: false,
+    score,
+    head,
+    tail,
+    core,
+    reason,
+  });
+
+  const a = canonicalCore(prompt);
+  const b = canonicalCore(turnText);
+
+  if (!a || !b) return bad("empty canonical form");
+  if (a.split(" ").length < 6) {
+    return a === b
+      ? { ok: true, score: 1, head: 1, tail: 1, core: 1, reason: "exact (short prompt)" }
+      : bad("short prompt differs");
+  }
+
+  const score = promptSimilarity(a, b);
+  if (score < MIN_SCORE) return bad(`similarity ${score.toFixed(2)} < ${MIN_SCORE}`, score);
+
+  let head = 1;
+  let tail = 1;
+  if (a.length >= SEG + 200 && b.length >= SEG + 200) {
+    head = promptSimilarity(a.slice(0, SEG), b.slice(0, SEG));
+    tail = promptSimilarity(a.slice(-SEG), b.slice(-SEG));
+    if (head < MIN_SEGMENT) return bad(`head differs (${head.toFixed(2)})`, score, head, tail);
+    if (tail < MIN_SEGMENT) return bad(`tail differs (${tail.toFixed(2)})`, score, head, tail);
+  }
+
+  let core = 1;
+  const ct = coreTokens(prompt);
+  if (ct.length >= MIN_CORE_TOKENS) {
+    const have = new Set(tokenize(turnText));
+    core = ct.filter((t) => have.has(t)).length / ct.length;
+    if (core < MIN_CORE) return bad(`core keywords missing (${core.toFixed(2)})`, score, head, tail, core);
+  }
+
+  return {
+    ok: true,
+    score,
+    head,
+    tail,
+    core,
+    reason: `canonical ${score.toFixed(3)} head ${head.toFixed(2)} tail ${tail.toFixed(2)} core ${core.toFixed(2)}`,
+  };
 }
 
 export async function readChatGPTSnapshot(page: Page): Promise<DomSnapshot> {
